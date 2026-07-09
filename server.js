@@ -20,8 +20,8 @@ const {
 const app        = express();
 const httpServer = createServer(app);
 const io         = new SocketIO(httpServer, {
-  // Same-origin only. If you put nginx in front on a different origin,
-  // set: cors: { origin: 'https://your-domain.com' }
+  // Same-origin only. If you put nginx/caddy in front on a different origin,
+  // set: cors: { origin: 'https://videofurge.voiceforgeai.site' }
   cors: { origin: false },
 });
 
@@ -109,15 +109,8 @@ app.get('/api/config', (req, res) => {
   });
 });
 
-// ---- Auth + rate-limit middleware for all /api/jobs routes ----
-// req.jobId is set here for every request but only consumed by POST /api/jobs.
-app.use('/api/jobs', requireAuth, (req, res, next) => {
-  if (!checkDailyRate(req.apiKey)) {
-    return res.status(429).json({ error: `rate limit: max ${MAX_JOBS_PER_DAY} jobs per 24h per key` });
-  }
-  req.jobId = uuid();
-  next();
-});
+// ---- Auth for all /api/jobs routes ----
+app.use('/api/jobs', requireAuth);
 
 // ---- Helpers ----
 
@@ -146,8 +139,16 @@ function jobSummary(job) {
 // ---- Routes ----
 
 // POST /api/jobs — create a new job (multipart upload)
+// Rate limit is enforced here only (not on list/detail/retry/delete).
 app.post(
   '/api/jobs',
+  (req, res, next) => {
+    if (!checkDailyRate(req.apiKey)) {
+      return res.status(429).json({ error: `rate limit: max ${MAX_JOBS_PER_DAY} jobs per 24h per key` });
+    }
+    req.jobId = uuid();
+    next();
+  },
   upload.fields([
     { name: 'media',           maxCount: 1  },
     { name: 'referenceImages', maxCount: 20 },
