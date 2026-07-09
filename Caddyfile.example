@@ -1,0 +1,19 @@
+# Caddy reverse proxy example (auto HTTPS + LE)
+# Place at /etc/caddy/Caddyfile or alongside, adapt domain + port.
+# Caddy is lightweight and great on small VPS.
+
+your-domain.example.com {
+    # Optional: basic rate limit at proxy too
+    reverse_proxy localhost:3000
+
+    # Logging
+    log {
+        output file /var/log/caddy/pipeline.log
+        format json
+    }
+}
+
+# If you want to serve the static assets or downloads with longer cache:
+# handle_path /api/jobs/*/download/* {
+#    reverse_proxy localhost:3000
+# }

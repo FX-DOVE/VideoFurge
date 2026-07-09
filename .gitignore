@@ -1,0 +1,37 @@
+# Dependency directories
+node_modules/
+
+# Local environment configuration (contains sensitive API keys and local paths)
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Local jobs database (contains uploads, reference images, and generated output videos/frames)
+jobs/
+
+# Cache directories (for downloaded sound effects and music)
+cache/
+
+# Whisper binaries and large GGML models (Whisper model ggml-base.en.bin is ~148MB and cannot be pushed to GitHub)
+whisper-bin/
+whisper-bin.zip
+
+# Logs
+*.log
+logs/
+
+# OS specific files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDEs and Editors
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?

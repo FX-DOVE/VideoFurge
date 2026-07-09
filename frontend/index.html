@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>VideoFurge — AI Video Pipeline</title>
+  <meta name="description" content="Turn audio narration into AI-generated animated video with cinematic visuals, background music, and word-level captions." />
+
+  <!-- Google Fonts: Inter -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet" />
+
+  <link rel="stylesheet" href="app.css" />
+</head>
+<body>
+
+  <!-- Real-time connection banner (shown on socket disconnect) -->
+  <div id="connection-banner" class="connection-banner hidden" role="status" aria-live="polite">
+    <span class="banner-dot"></span>
+    <span id="connection-banner-text">Connection lost — reconnecting…</span>
+  </div>
+
+  <!-- App header -->
+  <header class="app-header">
+    <div class="header-inner">
+      <a href="#/" class="logo" aria-label="VideoFurge — home">
+        <div class="logo-mark">
+          <svg width="22" height="22" viewBox="0 0 22 22" fill="none" aria-hidden="true">
+            <path d="M11 2L19.5 7V15L11 20L2.5 15V7L11 2Z" fill="url(#grad)" stroke="none"/>
+            <path d="M11 6L15.5 8.5V13.5L11 16L6.5 13.5V8.5L11 6Z" fill="rgba(255,255,255,0.15)" stroke="none"/>
+            <defs>
+              <linearGradient id="grad" x1="2.5" y1="2" x2="19.5" y2="20" gradientUnits="userSpaceOnUse">
+                <stop offset="0%" stop-color="#6366f1"/>
+                <stop offset="100%" stop-color="#8b5cf6"/>
+              </linearGradient>
+            </defs>
+          </svg>
+        </div>
+        <span class="logo-text">VideoFurge</span>
+      </a>
+
+      <nav class="header-nav" aria-label="Main navigation">
+        <a href="#/" class="nav-link" id="nav-jobs">Jobs</a>
+        <a href="#/new" class="nav-link nav-link-cta" id="nav-new">+ New Job</a>
+      </nav>
+
+      <button class="btn-icon" id="api-key-btn" title="API Key Settings" aria-label="Open API key settings">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+        </svg>
+      </button>
+    </div>
+  </header>
+
+  <!-- Main content — screens are rendered here by app.js -->
+  <main class="app-main" role="main">
+    <div id="app" class="container"></div>
+  </main>
+
+  <!-- Toast notifications -->
+  <div id="toasts" class="toasts" aria-live="polite" aria-atomic="false"></div>
+
+  <!-- Modal overlay (API key modal, confirm dialogs) -->
+  <div id="modal-overlay" class="modal-overlay hidden" role="dialog" aria-modal="true">
+    <div id="modal-box" class="modal-box"></div>
+  </div>
+
+  <!-- Socket.IO client (auto-served by socket.io package at this exact path) -->
+  <script src="/socket.io/socket.io.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
