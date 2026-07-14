@@ -36,6 +36,15 @@ const MAX_SCRIPT_CHARS = parseInt(process.env.MAX_SCRIPT_CHARS || '8000', 10);
 const ALLOWED_MIME = /^(audio|video)\//;
 const ALLOWED_EXT  = /\.(mp3|wav|m4a|aac|ogg|flac|mp4|mov|mkv|webm|avi)$/i;
 
+// Central list of allowed file upload field names for /api/jobs
+// (kept in sync between multer config and error messages)
+const ALLOWED_UPLOAD_FIELDS = [
+  { name: 'media',            maxCount: 1 },
+  { name: 'characterImages',  maxCount: 12 },
+  { name: 'styleReferences',  maxCount: 8 },
+  { name: 'referenceImages',  maxCount: 20 }, // legacy
+];
+
 const upload = multer({
   storage: multer.diskStorage({
     destination: (req, file, cb) => {
@@ -43,22 +52,34 @@ const upload = multer({
       fs.mkdirSync(path.join(dir, 'input'), { recursive: true });
       cb(null, path.join(dir, 'input'));
     },
-    filename: (req, file, cb) => cb(null, file.fieldname + path.extname(file.originalname)),
+    filename: (req, file, cb) => {
+      // For character images, give them stable indexed names so we can pair with metadata
+      if (file.fieldname === 'characterImages') {
+        // Will be renamed after upload based on index in handler
+        return cb(null, 'char_' + Date.now() + '_' + Math.random().toString(36).slice(2) + path.extname(file.originalname));
+      }
+      if (file.fieldname === 'styleReferences') {
+        return cb(null, 'style_' + Date.now() + '_' + Math.random().toString(36).slice(2) + path.extname(file.originalname));
+      }
+      cb(null, file.fieldname + path.extname(file.originalname));
+    },
   }),
   limits: {
     fileSize:  3 * 1024 * 1024 * 1024, // 3 GB per file
-    files:     21,   // 1 media + 20 reference images
-    fields:    10,   // title, script + a few spares
+    files:     30,   // 1 media + up to ~8 chars + style refs + legacy refs
+    fields:    15,
   },
   fileFilter: (req, file, cb) => {
-    // Reference images — pass through (ext validated in the route handler after upload)
+    // Character images and style refs — image types
+    if (file.fieldname === 'characterImages' || file.fieldname === 'styleReferences') {
+      return cb(null, true);
+    }
+    // Legacy referenceImages
     if (file.fieldname === 'referenceImages') return cb(null, true);
     // Media file — check mime/ext
     const okMime = ALLOWED_MIME.test(file.mimetype || '');
     const okExt  = ALLOWED_EXT.test(file.originalname || '');
     if (okMime || okExt) return cb(null, true);
-    // Pass error via cb — do NOT throw: throwing inside busboy callbacks bypasses
-    // Express error handling and crashes the request with an unhandled exception.
     cb(Object.assign(new Error('media must be an audio or video file'), { status: 400 }));
   },
 });
@@ -114,10 +135,41 @@ app.use('/api/jobs', requireAuth);
 
 // ---- Helpers ----
 
+// Which output files exist (so the UI only shows working players / download links).
+function getJobAssets(job) {
+  if (!job || job.status !== 'done') return null;
+  const out = path.join(jobDir(job.id), 'output');
+  const exists = (name) => {
+    try {
+      const p = path.join(out, name);
+      return fs.existsSync(p) && fs.statSync(p).size > 1000;
+    } catch (_) {
+      return false;
+    }
+  };
+  return {
+    video:  exists('final.mp4'),
+    acted:  exists('acted.mp4'),
+    concat: exists('concat-video.mp4'),
+    images: exists('images.zip')
+      || fs.existsSync(path.join(out, 'images'))
+      || fs.existsSync(path.join(out, 'videoclips')),
+  };
+}
+
 // Strip filesystem paths and heavy computed fields before sending to clients.
 function stripSafe(job) {
   if (!job) return null;
-  const { mediaPath, referenceImagePaths, segments, beats, styleSummary, apiKey, script, ...rest } = job;
+  const { mediaPath, referenceImagePaths, segments, beats, styleSummary, apiKey, script, styleReferencePaths, ...rest } = job;
+
+  // Sanitize characters: keep useful info for UI, remove disk paths
+  if (Array.isArray(rest.characters)) {
+    rest.characters = rest.characters.map(c => ({
+      name: c.name,
+      gender: c.gender || 'unspecified',
+    }));
+  }
+  rest.assets = getJobAssets(job);
   return rest;
 }
 
@@ -149,23 +201,26 @@ app.post(
     req.jobId = uuid();
     next();
   },
-  upload.fields([
-    { name: 'media',           maxCount: 1  },
-    { name: 'referenceImages', maxCount: 20 },
-  ]),
+  upload.fields(ALLOWED_UPLOAD_FIELDS),
   (req, res) => {
     try {
+      console.log(`[upload] starting job creation for apiKey=${req.apiKey?.slice(0,8)}... mediaSize=${req.headers['content-length'] || '?'} bytes`);
+      const t0 = Date.now();
       const totalUsed = getTotalStorageUsed();
       if (totalUsed > MAX_DISK_BYTES) {
+        console.warn('[upload] storage limit hit');
         return res.status(507).json({ error: 'VPS storage is near capacity, delete old jobs first' });
       }
 
-      const { title, script } = req.body;
-      if (!title || !script || !req.files?.media || !req.files?.referenceImages?.length) {
-        return res.status(400).json({
-          error: 'title, script, media file, and at least one reference image are required',
-        });
+      const { title, script, characters: charactersRaw, sceneStyle } = req.body;
+
+      if (!title || !script) {
+        return res.status(400).json({ error: 'title and script are required' });
       }
+      if (!req.files?.media) {
+        return res.status(400).json({ error: 'media file is required' });
+      }
+
       if (typeof script !== 'string' || script.length > MAX_SCRIPT_CHARS) {
         return res.status(400).json({ error: `script too long (max ${MAX_SCRIPT_CHARS} chars)` });
       }
@@ -173,28 +228,102 @@ app.post(
         return res.status(400).json({ error: 'title too long (max 200 chars)' });
       }
 
-      const media    = req.files.media[0];
+      const media = req.files.media[0];
       const badMedia = !ALLOWED_EXT.test(media.originalname) && !ALLOWED_MIME.test(media.mimetype || '');
       if (badMedia) {
         return res.status(400).json({ error: 'media must be an audio or video file' });
       }
-      for (const img of req.files.referenceImages) {
-        if (!/\.(png|jpg|jpeg|webp)$/i.test(img.originalname)) {
-          return res.status(400).json({ error: 'referenceImages must be png/jpg/jpeg/webp' });
+
+      // Parse structured characters (preferred)
+      let characters = [];
+      if (charactersRaw) {
+        try {
+          const parsed = JSON.parse(charactersRaw);
+          if (Array.isArray(parsed)) {
+            characters = parsed
+              .filter(c => c && typeof c.name === 'string' && c.name.trim())
+              .map(c => ({
+                name: c.name.trim().slice(0, 60),
+                gender: (c.gender || 'unspecified').toString().slice(0, 30),
+              }));
+          }
+        } catch (e) {
+          return res.status(400).json({ error: 'Invalid characters data' });
         }
       }
 
-      const job = createJob(req.jobId, {
-        title:               title.slice(0, 200),
-        script:              script.slice(0, MAX_SCRIPT_CHARS),
-        mediaPath:           req.files.media[0].path,
-        referenceImagePaths: req.files.referenceImages.map(f => f.path),
-        apiKey:              req.apiKey,
-      });
+      const charFiles = req.files.characterImages || [];
+      if (characters.length > 0) {
+        if (charFiles.length !== characters.length) {
+          return res.status(400).json({ error: `You provided ${characters.length} character(s) but uploaded ${charFiles.length} image(s). They must match.` });
+        }
+        // Validate image types
+        for (const f of charFiles) {
+          if (!/\.(png|jpg|jpeg|webp)$/i.test(f.originalname)) {
+            return res.status(400).json({ error: 'Character images must be PNG, JPG, or WebP' });
+          }
+        }
+      }
 
+      // Legacy fallback: turn old referenceImages into simple characters if no structured ones provided
+      const legacyRefs = req.files.referenceImages || [];
+      if (characters.length === 0 && legacyRefs.length > 0) {
+        for (const img of legacyRefs) {
+          if (!/\.(png|jpg|jpeg|webp)$/i.test(img.originalname)) {
+            return res.status(400).json({ error: 'referenceImages must be png/jpg/jpeg/webp' });
+          }
+        }
+        characters = legacyRefs.map((f, idx) => ({
+          name: `Character ${idx + 1}`,
+          gender: 'unspecified',
+          // we will assign paths below
+        }));
+      }
+
+      // Now assign image paths (new or legacy)
+      const finalCharacters = [];
+      const allCharFiles = [...charFiles, ...legacyRefs]; // prefer new, fallback uses legacy
+      for (let i = 0; i < characters.length; i++) {
+        const srcFile = allCharFiles[i];
+        if (!srcFile) break;
+        finalCharacters.push({
+          ...characters[i],
+          imagePath: srcFile.path,
+        });
+      }
+
+      // Optional style reference images (for art direction / environments)
+      const styleRefPaths = (req.files.styleReferences || []).map(f => f.path);
+
+      const jobData = {
+        title: title.slice(0, 200),
+        script: script.slice(0, MAX_SCRIPT_CHARS),
+        mediaPath: media.path,
+        characters: finalCharacters,
+        sceneStyle: (sceneStyle || '').toString().slice(0, 2000),
+        styleReferencePaths: styleRefPaths,
+        apiKey: req.apiKey,
+      };
+
+      // For backward compat with existing worker code that still looks for referenceImagePaths
+      if (finalCharacters.length > 0) {
+        jobData.referenceImagePaths = finalCharacters.map(c => c.imagePath);
+      } else if (legacyRefs.length) {
+        jobData.referenceImagePaths = legacyRefs.map(f => f.path);
+      }
+
+      if (!jobData.characters || jobData.characters.length === 0) {
+        return res.status(400).json({ error: 'At least one character (with image) is required for consistent visuals.' });
+      }
+
+      const job = createJob(req.jobId, jobData);
+      const dt = Date.now() - t0;
+      console.log(`[upload] job ${job.id} created in ${dt}ms (storage scan + write + checks)`);
+      _storageCache.ts = 0; // force fresh scan next time (we just added data)
       res.status(202).json({ id: job.id, status: job.status });
     } catch (err) {
-      next(err); // let the global error handler format the response
+      console.error('[upload] error during job creation', err);
+      next(err);
     }
   }
 );
@@ -220,7 +349,11 @@ app.get('/api/jobs/:id', (req, res, next) => {
   try {
     const job = readJob(req.params.id);
     if (!job) return res.status(404).json({ error: 'not found' });
-    const { mediaPath, referenceImagePaths, ...safe } = job;
+    const safe = stripSafe(job);
+    if (!safe) return res.status(404).json({ error: 'not found' });
+    safe.styleRefCount = Array.isArray(job.styleReferencePaths) ? job.styleReferencePaths.length : 0;
+    // Keep heavy fields the UI may still show (script is stripped for size)
+    safe.totalDurationMs = job.totalDurationMs || null;
     res.json(safe);
   } catch (err) {
     next(err);
@@ -234,6 +367,8 @@ app.get('/api/jobs/:id/download/:asset', async (req, res, next) => {
     if (!job || job.status !== 'done') return res.status(404).json({ error: 'not ready' });
     const targets = {
       video:  path.join(jobDir(job.id), 'output', 'final.mp4'),
+      acted:  path.join(jobDir(job.id), 'output', 'acted.mp4'),
+      concat: path.join(jobDir(job.id), 'output', 'concat-video.mp4'),
       images: path.join(jobDir(job.id), 'output', 'images.zip'),
     };
     let file = targets[req.params.asset];
@@ -281,16 +416,36 @@ app.get('/api/jobs/:id/download/:asset', async (req, res, next) => {
   }
 });
 
-// GET /api/jobs/:id/preview/video — inline video stream for <video src>.
+// GET /api/jobs/:id/preview/:asset — inline video stream for <video src>.
 // Uses res.sendFile so browsers can play inline and range-request for scrubbing.
 // Auth: also accepts ?k= query param because <video> cannot send custom headers.
-app.get('/api/jobs/:id/preview/video', (req, res, next) => {
+app.get('/api/jobs/:id/preview/:asset', (req, res, next) => {
   try {
     const job = readJob(req.params.id);
     if (!job || job.status !== 'done') return res.status(404).json({ error: 'not ready' });
-    const file = path.resolve(path.join(jobDir(job.id), 'output', 'final.mp4'));
+    
+    let filename;
+    if (req.params.asset === 'video') filename = 'final.mp4';
+    else if (req.params.asset === 'acted') filename = 'acted.mp4';
+    else return res.status(404).json({ error: 'asset not found' });
+
+    const file = path.resolve(path.join(jobDir(job.id), 'output', filename));
     if (!fs.existsSync(file)) return res.status(404).json({ error: 'asset not found' });
-    res.sendFile(file, (err) => { if (err && !res.headersSent) next(err); });
+
+    // Explicit media headers help browsers (and reverse proxies) treat this as
+    // a seekable video stream rather than a generic download.
+    res.setHeader('Content-Type', 'video/mp4');
+    res.setHeader('Accept-Ranges', 'bytes');
+    res.setHeader('Cache-Control', 'private, max-age=0, must-revalidate');
+    res.sendFile(file, {
+      acceptRanges: true,
+      // Do not force download; <video> needs inline playback
+      headers: {
+        'Content-Type': 'video/mp4',
+      },
+    }, (err) => {
+      if (err && !res.headersSent) next(err);
+    });
   } catch (err) {
     next(err);
   }
@@ -327,15 +482,30 @@ app.post('/api/jobs/:id/retry', (req, res, next) => {
 app.delete('/api/jobs/:id', (req, res, next) => {
   try {
     deleteJob(req.params.id);
+    _storageCache.ts = 0; // force fresh scan
     res.status(204).end();
   } catch (err) {
     next(err);
   }
 });
 
+// Cache to avoid expensive full recursive walks of jobs/ on every upload.
+// The storage limit (default 30 GB) is high, so a short staleness is fine.
+let _storageCache = { value: 0, ts: 0 };
+const STORAGE_CACHE_TTL_MS = 10_000; // 10 seconds
+
 function getTotalStorageUsed() {
-  if (!fs.existsSync(JOBS_DIR)) return 0;
-  return fs.readdirSync(JOBS_DIR).reduce((sum, id) => sum + jobStorageBytes(id), 0);
+  const now = Date.now();
+  if (now - _storageCache.ts < STORAGE_CACHE_TTL_MS) {
+    return _storageCache.value;
+  }
+  if (!fs.existsSync(JOBS_DIR)) {
+    _storageCache = { value: 0, ts: now };
+    return 0;
+  }
+  const total = fs.readdirSync(JOBS_DIR).reduce((sum, id) => sum + jobStorageBytes(id), 0);
+  _storageCache = { value: total, ts: now };
+  return total;
 }
 
 // ---- Static frontend ----
@@ -350,10 +520,13 @@ app.use((err, req, res, next) => {
   // Multer errors → 400 Bad Request (never 500)
   // Covers: LIMIT_FILE_SIZE, LIMIT_UNEXPECTED_FILE ("Unexpected field"), LIMIT_FILE_COUNT, etc.
   if (err instanceof multer.MulterError || err.status === 400) {
+    const expected = ALLOWED_UPLOAD_FIELDS.map(f => `"${f.name}"`).join(', ');
     const msg = err.code === 'LIMIT_FILE_SIZE'       ? 'File too large (max 3 GB)'
               : err.code === 'LIMIT_FILE_COUNT'      ? 'Too many files'
-              : err.code === 'LIMIT_UNEXPECTED_FILE' ? `Unexpected upload field: "${err.field}" — expected "media" or "referenceImages"`
+              : err.code === 'LIMIT_UNEXPECTED_FILE' ? `Unexpected upload field: "${err.field}" — expected one of: ${expected}`
               : err.message || 'File upload error';
+    // Note: characterImages + styleReferences are the modern fields.
+    // referenceImages is legacy only.
     console.warn('[upload 400]', msg);
     return res.status(400).json({ error: msg });
   }

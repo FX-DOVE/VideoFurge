@@ -546,9 +546,9 @@ function _renderNewJob() {
             <div class="field-error hidden" id="e-title"></div>
           </div>
           <div class="form-field">
-            <label class="form-label" for="f-script">Script / Scene Context <span class="required">*</span></label>
+            <label class="form-label" for="f-script">Script / Narration <span class="required">*</span></label>
             <textarea id="f-script" class="form-input form-textarea"
-              placeholder="Describe the story, characters, and visual style. This guides image generation for every scene."
+              placeholder="The spoken words. The AI will generate visuals that literally act out what is being said in each moment. Be specific about actions, emotions, and who is doing what."
               maxlength="8000" rows="7"></textarea>
             <div class="field-hint"><span id="script-count">0</span>/8,000</div>
             <div class="field-error hidden" id="e-script"></div>
@@ -573,26 +573,42 @@ function _renderNewJob() {
         </div>
 
         <div class="form-section">
-          <h2 class="form-section-title">Reference Images</h2>
-          <p class="form-section-desc">Upload 1–20 images (PNG, JPG, WebP) that define the visual style and characters. VideoFurge analyses these once to produce a style description reused across all generated frames.</p>
-          <div class="form-field">
-            <div class="file-drop-zone" id="images-zone">
-              <input type="file" id="f-images" class="file-input"
-                accept="image/png,image/jpeg,image/webp,.png,.jpg,.jpeg,.webp" multiple />
-              <div class="file-drop-content" id="images-zone-content">
-                <div class="file-drop-icon">🖼️</div>
-                <div class="file-drop-text">Click to select images (1–20)</div>
-                <div class="file-drop-hint">PNG, JPG, or WebP</div>
+          <h2 class="form-section-title">Characters <span class="required">*</span></h2>
+          <p class="form-section-desc">
+            Add the main people who appear in your story. <strong>The AI (Grok) will actually "see" these photos</strong> through its vision when we attach them (using @image paths). It will detect the exact style — real photograph, 3D render, cartoon, pixel art, stick figure, painted, etc. — and match that style in the generated scenes.
+            We use image-to-image so characters stay visually consistent. Give them names.
+          </p>
+
+          <div id="characters-container"></div>
+          <button type="button" class="btn btn-secondary" id="add-character-btn" style="margin-top: 4px;">+ Add Character</button>
+          <div class="field-error hidden" id="e-characters"></div>
+
+          <div class="form-field" style="margin-top: var(--sp-5);">
+            <label class="form-label">Additional Style References (optional)</label>
+            <p class="form-section-desc" style="margin-bottom: 6px; font-size: 12px;">
+              Upload extra images (environments, backgrounds, lighting refs, props, architecture, etc.).
+              For every scene the AI will intelligently combine your character photos + these style refs via image-to-image to create the perfect composition.
+            </p>
+            <div class="file-drop-zone" id="style-refs-zone" style="padding: 12px;">
+              <input type="file" id="f-style-refs" class="file-input" accept="image/png,image/jpeg,image/webp" multiple />
+              <div class="file-drop-content" id="style-refs-content">
+                <div class="file-drop-text">Click or drop style refs (backgrounds, lighting, props...)</div>
               </div>
             </div>
-            <div class="image-previews hidden" id="image-previews"></div>
-            <div class="field-error hidden" id="e-images"></div>
+            <div class="image-previews hidden" id="style-refs-previews" style="margin-top: 6px;"></div>
+          </div>
+
+          <div class="form-field" style="margin-top: var(--sp-6);">
+            <label class="form-label" for="f-scene-style">Scene Style &amp; Visual Direction (optional but recommended)</label>
+            <textarea id="f-scene-style" class="form-input form-textarea" rows="3"
+              placeholder="e.g. Warm cinematic realism with golden hour sunlight... OR 'Keep the exact same cartoon style as the character drawings' OR 'Match the pixel art look of the references'"></textarea>
+            <div class="field-hint">You can reinforce or correct the style. Grok vision reads the actual uploaded images to classify the style (real / 3D / cartoon / pixel / etc.) and will follow it.</div>
           </div>
         </div>
 
         <div class="upload-progress-section hidden" id="upload-progress">
           <div class="upload-progress-label">
-            <span>Uploading…</span>
+            <span id="upload-status-text">Uploading…</span>
             <span id="upload-pct">0%</span>
           </div>
           <div class="progress-bar">
@@ -662,56 +678,308 @@ function _initNewJobForm() {
     tag.onerror = () => URL.revokeObjectURL(objUrl);
   });
 
-  // Reference images
-  let selectedImages = [];
-  const imagesInput = document.getElementById('f-images');
-  imagesInput.addEventListener('change', () => {
-    const added = Array.from(imagesInput.files);
-    selectedImages = [...selectedImages, ...added].slice(0, 20);
-    _paintImagePreviews(selectedImages);
-    // Reset so same file can be re-added after remove (and to allow change event to fire again)
-    imagesInput.value = '';
-  });
+  // === NEW STRUCTURED CHARACTERS SYSTEM ===
+  let characters = []; // {id, name, gender, file}
+  let styleRefFiles = []; // additional style / environment images
 
-  // Submit
-  document.getElementById('new-job-form').addEventListener('submit', (e) => {
-    e.preventDefault();
-    if (_validateNewJobForm(selectedImages)) _submitNewJob(selectedImages);
-  });
-}
-
-function _paintImagePreviews(images) {
-  const container = document.getElementById('image-previews');
-  const zoneContent = document.getElementById('images-zone-content');
-  if (!container || !zoneContent) return;
-
-  if (images.length === 0) {
-    container.classList.add('hidden');
-    zoneContent.innerHTML = `
-      <div class="file-drop-icon">🖼️</div>
-      <div class="file-drop-text">Click to select images (1–20)</div>
-      <div class="file-drop-hint">PNG, JPG, or WebP</div>`;
-    return;
+  function createCharacter() {
+    if (characters.length >= 8) {
+      showToast('Maximum 8 characters recommended for best results.', 'info');
+      return;
+    }
+    characters.push({
+      id: 'c_' + Date.now() + '_' + Math.random().toString(36).slice(2),
+      name: '',
+      gender: 'male',
+      file: null,
+    });
+    _renderCharacters();
   }
 
-  container.classList.remove('hidden');
-  zoneContent.innerHTML = `<div class="file-drop-text">${images.length}/20 images — click to add more</div>`;
-  container.innerHTML = images.map((f, i) => `
-    <div class="image-thumb-wrap" id="it-${i}">
-      <img src="${URL.createObjectURL(f)}" alt="${escAttr(f.name)}" class="image-thumb" />
-      <button type="button" class="thumb-remove" data-img-idx="${i}" aria-label="Remove">✕</button>
-    </div>`).join('');
+  function removeCharacter(id) {
+    characters = characters.filter(c => c.id !== id);
+    _renderCharacters();
+  }
 
-  container.querySelectorAll('.thumb-remove').forEach(btn => {
-    btn.addEventListener('click', () => {
-      const idx = parseInt(btn.dataset.imgIdx, 10);
-      images.splice(idx, 1);
-      _paintImagePreviews(images);
+  function updateCharacter(id, patch) {
+    const c = characters.find(x => x.id === id);
+    if (c) Object.assign(c, patch);
+  }
+
+  function handleCharacterFile(id, file) {
+    const c = characters.find(x => x.id === id);
+    if (!c) return;
+    c.file = file;
+    _renderCharacters();
+  }
+
+  window._addCharacter = createCharacter; // for button
+
+  function _renderCharacters() {
+    const container = document.getElementById('characters-container');
+    if (!container) return;
+
+    if (characters.length === 0) {
+      container.innerHTML = `
+        <div class="char-empty-state">
+          No characters added yet. Click "+ Add Character" above.
+        </div>`;
+      return;
+    }
+
+    container.innerHTML = characters.map((c, idx) => {
+      const previewUrl = c.file ? URL.createObjectURL(c.file) : null;
+      return `
+      <div class="character-row" data-id="${c.id}">
+        <div class="char-index">#${idx + 1}</div>
+
+        <div class="char-fields">
+          <div class="char-field">
+            <label class="char-label">Name</label>
+            <input type="text" class="form-input char-name" value="${escAttr(c.name)}"
+                   placeholder="e.g. Emeka" data-field="name" />
+          </div>
+
+          <div class="char-field">
+            <label class="char-label">Gender</label>
+            <select class="form-input char-gender" data-field="gender">
+              <option value="male" ${c.gender === 'male' ? 'selected' : ''}>Male</option>
+              <option value="female" ${c.gender === 'female' ? 'selected' : ''}>Female</option>
+              <option value="nonbinary" ${c.gender === 'nonbinary' ? 'selected' : ''}>Non-binary</option>
+              <option value="unspecified" ${c.gender === 'unspecified' ? 'selected' : ''}>Unspecified</option>
+            </select>
+          </div>
+
+          <div class="char-field char-photo-field">
+            <label class="char-label">Photo</label>
+            <div class="char-photo-controls">
+              <button type="button" class="btn btn-sm btn-secondary char-choose-btn">Choose Photo</button>
+              <input type="file" accept="image/png,image/jpeg,image/webp" class="char-file-input hidden" />
+              ${previewUrl ? `
+                <div class="char-thumb">
+                  <img src="${previewUrl}" alt="${escAttr(c.name || 'character')}" />
+                  <button type="button" class="thumb-remove char-remove-photo" title="Remove photo">✕</button>
+                </div>` : ''}
+            </div>
+          </div>
+        </div>
+
+        <button type="button" class="btn btn-sm btn-danger-ghost char-remove-btn" title="Remove character">Remove</button>
+      </div>`;
+    }).join('');
+
+    // Bind events
+    container.querySelectorAll('.character-row').forEach(row => {
+      const id = row.dataset.id;
+
+      // Name + Gender
+      row.querySelectorAll('input, select').forEach(el => {
+        el.addEventListener('input', () => {
+          const field = el.dataset.field;
+          if (field === 'name') updateCharacter(id, { name: el.value });
+          if (field === 'gender') updateCharacter(id, { gender: el.value });
+        });
+      });
+
+      // Choose photo
+      const chooseBtn = row.querySelector('.char-choose-btn');
+      const fileInput = row.querySelector('.char-file-input');
+      if (chooseBtn && fileInput) {
+        chooseBtn.onclick = () => fileInput.click();
+        fileInput.onchange = () => {
+          const f = fileInput.files[0];
+          if (f) handleCharacterFile(id, f);
+          fileInput.value = '';
+        };
+      }
+
+      // Remove photo
+      const removePhoto = row.querySelector('.char-remove-photo');
+      if (removePhoto) {
+        removePhoto.onclick = () => {
+          updateCharacter(id, { file: null });
+          _renderCharacters();
+        };
+      }
+
+      // Remove entire character
+      const removeBtn = row.querySelector('.char-remove-btn');
+      if (removeBtn) {
+        removeBtn.onclick = () => removeCharacter(id);
+      }
     });
+  }
+
+  // Add character button
+  const addBtn = document.getElementById('add-character-btn');
+  if (addBtn) {
+    addBtn.onclick = () => {
+      createCharacter();
+    };
+  }
+
+  // Start with one empty character slot
+  characters.push({ id: 'c_' + Date.now(), name: '', gender: 'male', file: null });
+  _renderCharacters();
+
+  // === Additional Style References handling ===
+  function _paintStyleRefs() {
+    const container = document.getElementById('style-refs-previews');
+    const zoneContent = document.getElementById('style-refs-content');
+    if (!container || !zoneContent) return;
+
+    if (styleRefFiles.length === 0) {
+      container.classList.add('hidden');
+      zoneContent.innerHTML = `<div class="file-drop-text">Click or drop style refs (backgrounds, lighting, props...)</div>`;
+      return;
+    }
+
+    container.classList.remove('hidden');
+    zoneContent.innerHTML = `<div class="file-drop-text">${styleRefFiles.length} style reference(s) — click to add more</div>`;
+
+    container.innerHTML = styleRefFiles.map((f, i) => `
+      <div class="image-thumb-wrap" style="width:70px;height:70px;">
+        <img src="${URL.createObjectURL(f)}" alt="${escAttr(f.name)}" class="image-thumb" />
+        <button type="button" class="thumb-remove" data-style-idx="${i}" aria-label="Remove">✕</button>
+      </div>`).join('');
+
+    container.querySelectorAll('.thumb-remove').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const idx = parseInt(btn.dataset.styleIdx, 10);
+        styleRefFiles.splice(idx, 1);
+        _paintStyleRefs();
+      });
+    });
+  }
+
+  const styleInput = document.getElementById('f-style-refs');
+  if (styleInput) {
+    styleInput.addEventListener('change', () => {
+      const added = Array.from(styleInput.files).slice(0, 10);
+      styleRefFiles = [...styleRefFiles, ...added].slice(0, 10);
+      _paintStyleRefs();
+      styleInput.value = '';
+    });
+  }
+
+  // Local submit function defined *inside* _initNewJobForm so it has direct
+  // lexical access to `characters` and `styleRefFiles` (both declared in this scope).
+  // This prevents any possibility of "xxx is not defined" ReferenceErrors caused
+  // by forgetting to pass closure variables to a top-level helper.
+  function submitNewJob() {
+    if (!hasApiKey()) { showApiKeyModal(true); return; }
+
+    const title = document.getElementById('f-title').value.trim();
+    const script = document.getElementById('f-script').value.trim();
+    const mediaFile = document.getElementById('f-media').files[0];
+    const sceneStyle = (document.getElementById('f-scene-style')?.value || '').trim();
+
+    const validChars = (characters || []).filter(c => c.name && c.name.trim() && c.file);
+
+    const fd = new FormData();
+    fd.append('title', title);
+    fd.append('script', script);
+    fd.append('media', mediaFile);
+    if (sceneStyle) fd.append('sceneStyle', sceneStyle);
+
+    // Structured characters
+    const meta = validChars.map(c => ({ name: c.name.trim(), gender: c.gender || 'unspecified' }));
+    fd.append('characters', JSON.stringify(meta));
+
+    validChars.forEach(c => {
+      fd.append('characterImages', c.file);
+    });
+
+    // Additional style references — direct access to the array from this scope
+    (styleRefFiles || []).forEach(f => {
+      fd.append('styleReferences', f);
+    });
+
+    // Show upload progress bar
+    const progressSec = document.getElementById('upload-progress');
+    const submitBtn = document.getElementById('submit-btn');
+    const statusText = document.getElementById('upload-status-text');
+    const pctEl = document.getElementById('upload-pct');
+    const fillEl = document.getElementById('upload-fill');
+
+    progressSec.classList.remove('hidden');
+    submitBtn.disabled = true;
+    submitBtn.textContent = 'Uploading…';
+    if (statusText) statusText.textContent = 'Uploading…';
+
+    const xhr = new XMLHttpRequest();
+
+    // Long timeout because large media files + server-side work (storage scan, writes) can take time
+    xhr.timeout = 15 * 60 * 1000; // 15 minutes
+
+    let uploadComplete = false;
+
+    xhr.upload.addEventListener('progress', (e) => {
+      if (!e.lengthComputable) return;
+      const pct = Math.round((e.loaded / e.total) * 100);
+      if (pctEl) pctEl.textContent = `${pct}%`;
+      if (fillEl) fillEl.style.width = `${pct}%`;
+
+      if (pct >= 100 && !uploadComplete) {
+        uploadComplete = true;
+        if (statusText) statusText.textContent = 'Finalizing on server…';
+        if (pctEl) pctEl.textContent = '100%';
+        if (fillEl) fillEl.style.width = '100%';
+      }
+    });
+
+    const resetBtn = () => {
+      submitBtn.disabled = false;
+      submitBtn.textContent = 'Start Processing';
+      progressSec.classList.add('hidden');
+      if (statusText) statusText.textContent = 'Uploading…';
+      if (pctEl) pctEl.textContent = '0%';
+      if (fillEl) fillEl.style.width = '0%';
+    };
+
+    xhr.addEventListener('load', () => {
+      if (xhr.status === 202) {
+        let id;
+        try { id = JSON.parse(xhr.responseText).id; } catch (_) { }
+        if (id) {
+          showToast('Job created! Redirecting to progress…', 'success');
+          Router.go(`#/jobs/${id}`);
+        } else {
+          showToast('Job created (could not read ID — check the jobs list).', 'info');
+          Router.go('#/');
+        }
+      } else {
+        let msg = `Upload failed — server returned ${xhr.status}.`;
+        try { msg = JSON.parse(xhr.responseText).error || msg; } catch (_) { }
+        showToast(msg, 'error', 7000);
+        resetBtn();
+      }
+    });
+
+    xhr.addEventListener('error', () => {
+      showToast('Network error during upload. Check your connection and try again.', 'error');
+      resetBtn();
+    });
+
+    xhr.addEventListener('timeout', () => {
+      showToast('Upload timed out. Try again or check your connection.', 'error');
+      resetBtn();
+    });
+
+    xhr.open('POST', '/api/jobs');
+    xhr.setRequestHeader('X-API-Key', getApiKey());
+    // NOTE: Do NOT set Content-Type manually — the browser must set it with the multipart boundary.
+    xhr.send(fd);
+  }
+
+  // Submit handler — calls the local function that has closure access to everything
+  document.getElementById('new-job-form').addEventListener('submit', (e) => {
+    e.preventDefault();
+    if (_validateNewJobForm(characters)) submitNewJob();
   });
 }
 
-function _validateNewJobForm(selectedImages) {
+function _validateNewJobForm(characters) {
   let ok = true;
   const setErr = (id, msg) => {
     const el = document.getElementById(id);
@@ -730,80 +998,25 @@ function _validateNewJobForm(selectedImages) {
   setErr('e-script', !script ? 'Script is required.'
     : script.length > 8000 ? 'Script too long (max 8,000 characters).' : '');
   setErr('e-media', !media ? 'Please select a media file.' : '');
-  setErr('e-images', selectedImages.length === 0 ? 'At least one reference image is required.'
-    : selectedImages.length > 20 ? 'Maximum 20 reference images.' : '');
+
+  // Characters validation
+  const validChars = (characters || []).filter(c => c.name && c.name.trim() && c.file);
+  if (validChars.length === 0) {
+    setErr('e-characters', 'Add at least one character with a name and photo. These are used for image-to-image consistency.');
+  } else {
+    setErr('e-characters', '');
+  }
+
+  // style refs are optional — no error
+
   return ok;
 }
 
-function _submitNewJob(selectedImages) {
-  if (!hasApiKey()) { showApiKeyModal(true); return; }
-
-  const title = document.getElementById('f-title').value.trim();
-  const script = document.getElementById('f-script').value.trim();
-  const mediaFile = document.getElementById('f-media').files[0];
-
-  const fd = new FormData();
-  fd.append('title', title);
-  fd.append('script', script);
-  fd.append('media', mediaFile);
-  selectedImages.forEach(img => fd.append('referenceImages', img));
-
-  // Show upload progress bar
-  const progressSec = document.getElementById('upload-progress');
-  const submitBtn = document.getElementById('submit-btn');
-  progressSec.classList.remove('hidden');
-  submitBtn.disabled = true;
-  submitBtn.textContent = 'Uploading…';
-
-  const xhr = new XMLHttpRequest();
-
-  xhr.upload.addEventListener('progress', (e) => {
-    if (!e.lengthComputable) return;
-    const pct = Math.round((e.loaded / e.total) * 100);
-    document.getElementById('upload-pct').textContent = `${pct}%`;
-    document.getElementById('upload-fill').style.width = `${pct}%`;
-  });
-
-  const resetBtn = () => {
-    submitBtn.disabled = false;
-    submitBtn.textContent = 'Start Processing';
-    progressSec.classList.add('hidden');
-  };
-
-  xhr.addEventListener('load', () => {
-    if (xhr.status === 202) {
-      let id;
-      try { id = JSON.parse(xhr.responseText).id; } catch (_) { }
-      if (id) {
-        showToast('Job created! Redirecting to progress…', 'success');
-        Router.go(`#/jobs/${id}`);
-      } else {
-        showToast('Job created (could not read ID — check the jobs list).', 'info');
-        Router.go('#/');
-      }
-    } else {
-      let msg = `Upload failed — server returned ${xhr.status}.`;
-      try { msg = JSON.parse(xhr.responseText).error || msg; } catch (_) { }
-      showToast(msg, 'error', 7000);
-      resetBtn();
-    }
-  });
-
-  xhr.addEventListener('error', () => {
-    showToast('Network error during upload. Check your connection and try again.', 'error');
-    resetBtn();
-  });
-
-  xhr.addEventListener('timeout', () => {
-    showToast('Upload timed out. Try again or check your connection.', 'error');
-    resetBtn();
-  });
-
-  xhr.open('POST', '/api/jobs');
-  xhr.setRequestHeader('X-API-Key', getApiKey());
-  // NOTE: Do NOT set Content-Type manually — the browser must set it with the multipart boundary.
-  xhr.send(fd);
-}
+// _submitNewJob was moved inside _initNewJobForm() (as `submitNewJob`)
+// so it always has direct access to the `characters` and `styleRefFiles`
+// variables declared in that scope. The old top-level function is intentionally
+// removed to prevent any future "xxx is not defined" errors from scope mistakes.
+// (The new job form is the only caller.)
 
 // =============================================================
 // SCREEN 3: JOB DETAIL
@@ -858,20 +1071,55 @@ function _paintJobDetail(job) {
   const isFailed = job.status === 'failed';
   const isActive = !isDone && !isFailed;
 
+  // Prefer server-reported assets; if missing (old server), assume final exists.
+  const assets = job.assets || { video: true, acted: true, concat: true, images: true };
+  const finalSrc = mediaUrl(`/api/jobs/${job.id}/preview/video`);
+  const actedSrc = mediaUrl(`/api/jobs/${job.id}/preview/acted`);
+
   const videoSection = isDone ? `
-    <div class="card detail-card">
-      <h2 class="card-section-title">🎬 Output Video</h2>
-      <div class="video-player-wrap">
-        <video id="result-video" class="result-video" controls preload="metadata"
-          src="${escAttr(mediaUrl(`/api/jobs/${job.id}/preview/video`))}">
+    <div class="card detail-card" id="d-video-card">
+      ${assets.video !== false ? `
+      <h2 class="card-section-title">🎬 Final Video (Documentary Style)</h2>
+      <div class="video-player-wrap" data-player="final">
+        <video id="result-video" class="result-video" controls playsinline
+          preload="metadata" src="${escAttr(finalSrc)}">
           Your browser does not support HTML5 video playback.
         </video>
-      </div>
-      <div class="download-actions">
-        <a href="${escAttr(mediaUrl(`/api/jobs/${job.id}/download/video`))}"
-          class="btn btn-primary" download>⬇ Download Video (MP4)</a>
-        <a href="${escAttr(mediaUrl(`/api/jobs/${job.id}/download/images`))}"
-          class="btn btn-secondary" download>⬇ Download Assets for CapCut (ZIP)</a>
+        <div class="video-toolbar">
+          <button type="button" class="btn btn-primary" id="btn-play-final" data-play-for="result-video">▶ Play / Pause</button>
+          <button type="button" class="btn btn-ghost" id="btn-reload-final" data-reload-for="result-video">↻ Reload</button>
+          <span class="video-status" id="status-result-video">Ready</span>
+        </div>
+        <div class="video-error hidden" id="result-video-error"></div>
+      </div>` : `
+      <p class="error-hint">Final video file is not available for this job.</p>`}
+
+      ${assets.acted !== false ? `
+      <h2 class="card-section-title" style="margin-top: 2rem;">🎬 Acted Video (Full Drama Scene)</h2>
+      <div class="video-player-wrap" data-player="acted">
+        <video id="result-acted-video" class="result-video" controls playsinline
+          preload="none" data-src="${escAttr(actedSrc)}">
+          Your browser does not support HTML5 video playback.
+        </video>
+        <div class="video-toolbar">
+          <button type="button" class="btn btn-primary" id="btn-play-acted" data-play-for="result-acted-video">▶ Play / Pause</button>
+          <button type="button" class="btn btn-ghost" id="btn-reload-acted" data-reload-for="result-acted-video">↻ Reload</button>
+          <span class="video-status" id="status-result-acted-video">Click Play to load (~60–90 MB)</span>
+        </div>
+        <div class="video-error hidden" id="result-acted-video-error"></div>
+      </div>` : `
+      <h2 class="card-section-title" style="margin-top: 2rem;">🎬 Acted Video (Full Drama Scene)</h2>
+      <p class="error-hint">Acted video was not generated for this job (file missing). Download Final instead, or re-run the job.</p>`}
+
+      <div class="download-actions" style="margin-top: 1.5rem; display: flex; gap: 0.5rem; flex-wrap: wrap;">
+        ${assets.video !== false ? `<a href="${escAttr(mediaUrl(`/api/jobs/${job.id}/download/video`))}"
+          class="btn btn-primary" download>⬇ Download Final Video (Voice + BGM + SFX)</a>` : ''}
+        ${assets.acted !== false ? `<a href="${escAttr(mediaUrl(`/api/jobs/${job.id}/download/acted`))}"
+          class="btn btn-secondary" download>⬇ Download Acted Video (BGM + SFX, no Voice)</a>` : ''}
+        ${assets.concat !== false ? `<a href="${escAttr(mediaUrl(`/api/jobs/${job.id}/download/concat`))}"
+          class="btn btn-ghost" download>⬇ Download Stitched Video (No Audio)</a>` : ''}
+        ${assets.images !== false ? `<a href="${escAttr(mediaUrl(`/api/jobs/${job.id}/download/images`))}"
+          class="btn btn-ghost" download>⬇ Download CapCut Assets (ZIP)</a>` : ''}
       </div>
     </div>` : '';
 
@@ -938,13 +1186,28 @@ function _paintJobDetail(job) {
       </div>
     </div>
 
+    ${job.characters && job.characters.length ? `
+    <div class="card detail-card">
+      <h2 class="card-section-title">👤 Characters (for consistency)</h2>
+      <div class="characters-summary">
+        ${job.characters.map(c => `
+          <div class="char-pill">
+            <span class="char-name">${escHtml(c.name)}</span>
+            <span class="char-gender">${escHtml(c.gender || '')}</span>
+          </div>
+        `).join('')}
+      </div>
+      ${job.sceneStyle ? `<div class="scene-style-note"><strong>Style:</strong> ${escHtml(job.sceneStyle)}</div>` : ''}
+      ${job.styleRefCount ? `<div style="font-size:12px; color:var(--clr-text-2); margin-top:4px;">+ ${job.styleRefCount} additional style references (used for multi-image scene composition)</div>` : ''}
+    </div>` : ''}
+
     ${videoSection}
     ${errorSection}
 
     <div class="card detail-card detail-card-danger">
       <h2 class="card-section-title">Danger Zone</h2>
       <p class="danger-desc">
-        Permanently delete all files for this job: uploaded media, reference images,
+        Permanently delete all files for this job: uploaded media, character photos,
         all generated frames, and the final video. This cannot be undone.
       </p>
       <button class="btn btn-danger" id="d-delete-btn">🗑 Delete This Job</button>
@@ -975,18 +1238,143 @@ function _paintJobDetail(job) {
       showToast(`Retry failed: ${err.message}`, 'error');
     }
   });
+
+  // Wire reliable external Play buttons (native controls alone can be unclickable
+  // when a parent uses overflow:hidden / stacking quirks).
+  _wireVideoPlayer('result-video', 'result-video-error', 'Final');
+  _wireVideoPlayer('result-acted-video', 'result-acted-video-error', 'Acted');
+}
+
+function _setVideoStatus(videoId, text) {
+  const el = document.getElementById(`status-${videoId}`);
+  if (el) el.textContent = text;
+}
+
+function _ensureVideoSrc(video) {
+  // Acted uses data-src + preload=none so we don't block the smaller final video.
+  if (!video) return;
+  const pending = video.getAttribute('data-src');
+  if (pending && !video.getAttribute('src')) {
+    video.setAttribute('src', pending);
+    video.removeAttribute('data-src');
+    try { video.load(); } catch (_) {}
+  }
+}
+
+function _wireVideoPlayer(videoId, errorId, label) {
+  const video = document.getElementById(videoId);
+  const errEl = document.getElementById(errorId);
+  if (!video) return;
+
+  const showErr = (msg) => {
+    if (!errEl) return;
+    errEl.classList.remove('hidden');
+    errEl.textContent = msg;
+  };
+  const hideErr = () => { if (errEl) errEl.classList.add('hidden'); };
+
+  // Kick metadata load only when a src is already present (final video).
+  if (video.getAttribute('src')) {
+    try { video.load(); } catch (_) {}
+  }
+
+  video.addEventListener('error', () => {
+    const code = video.error?.code;
+    const map = {
+      1: 'playback aborted',
+      2: 'network error while loading',
+      3: 'video decode failed (file may be corrupted or use an unsupported codec)',
+      4: 'format/source not supported or file missing (404)',
+    };
+    const reason = map[code] || 'unknown playback error';
+    _setVideoStatus(videoId, 'Error');
+    showErr(`${label} video could not play: ${reason}. Use the Download button below, or hard-refresh (Ctrl+F5).`);
+    console.warn(`[video] ${label} error`, video.error, video.currentSrc || video.getAttribute('data-src'));
+  });
+
+  video.addEventListener('loadstart', () => _setVideoStatus(videoId, 'Loading…'));
+  video.addEventListener('waiting', () => _setVideoStatus(videoId, 'Buffering…'));
+  video.addEventListener('canplay', () => {
+    hideErr();
+    _setVideoStatus(videoId, video.paused ? 'Ready' : 'Playing');
+  });
+  video.addEventListener('playing', () => {
+    hideErr();
+    _setVideoStatus(videoId, 'Playing');
+  });
+  video.addEventListener('pause', () => {
+    if (!video.ended) _setVideoStatus(videoId, 'Paused');
+  });
+  video.addEventListener('ended', () => _setVideoStatus(videoId, 'Ended'));
+  video.addEventListener('loadedmetadata', () => {
+    hideErr();
+    const dur = isFinite(video.duration) ? `${Math.round(video.duration)}s` : '';
+    _setVideoStatus(videoId, dur ? `Ready (${dur})` : 'Ready');
+  });
+
+  // Explicit toolbar buttons — always clickable (outside the media element)
+  const playBtn = document.querySelector(`[data-play-for="${videoId}"]`);
+  const reloadBtn = document.querySelector(`[data-reload-for="${videoId}"]`);
+
+  if (playBtn) {
+    playBtn.addEventListener('click', async (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      hideErr();
+      _ensureVideoSrc(video);
+      try {
+        if (video.paused || video.ended) {
+          _setVideoStatus(videoId, 'Starting…');
+          // Pause the other player so only one stream is active
+          document.querySelectorAll('video.result-video').forEach(v => {
+            if (v !== video && !v.paused) v.pause();
+          });
+          await video.play();
+          _setVideoStatus(videoId, 'Playing');
+        } else {
+          video.pause();
+          _setVideoStatus(videoId, 'Paused');
+        }
+      } catch (err) {
+        _setVideoStatus(videoId, 'Play blocked');
+        showErr(`${label}: could not start playback (${err.message || err}). Try Reload, or Download the file.`);
+      }
+    });
+  }
+
+  if (reloadBtn) {
+    reloadBtn.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      hideErr();
+      _ensureVideoSrc(video);
+      // Bust browser cache on reload
+      const base = (video.currentSrc || video.getAttribute('src') || '').split('#')[0];
+      if (base) {
+        const joiner = base.includes('?') ? '&' : '?';
+        video.src = `${base}${joiner}_r=${Date.now()}`;
+      }
+      try { video.load(); } catch (_) {}
+      _setVideoStatus(videoId, 'Reloading…');
+    });
+  }
 }
 
 // Called by socket 'job:update' event — partial in-place DOM update for active jobs.
-// When the job reaches a terminal state (done/failed), does a full repaint.
+// When the job reaches a terminal state (done/failed), does a full repaint once.
 function _applyJobDetailUpdate(job) {
   _detailJob = job;
   const titleEl = document.getElementById('d-title');
   if (titleEl) titleEl.textContent = job.title;
 
   if (job.status === 'done' || job.status === 'failed') {
-    // Full repaint to show video player / error section
-    _paintJobDetail(job);
+    // Do NOT full-repaint if the terminal UI is already showing — destroying <video>
+    // elements mid-load/play is a common reason the second (acted) player never works.
+    const alreadyDone = job.status === 'done' && document.getElementById('d-video-card');
+    const alreadyFailed = job.status === 'failed' && document.querySelector('.detail-card-error');
+    if (!alreadyDone && !alreadyFailed) {
+      _paintJobDetail(job);
+    }
     return;
   }
 

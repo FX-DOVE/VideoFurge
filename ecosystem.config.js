@@ -1,7 +1,12 @@
-// pm2 ecosystem for the pipeline (single VPS, one-job-at-a-time design).
+// pm2 ecosystem for the pipeline.
+// - Server: always 1 instance
+// - Worker: 2 instances so two jobs can be processed concurrently.
+//   The claimNextQueuedJob() logic ensures a worker only takes a job
+//   that is still 'queued' and immediately marks it 'transcribing'
+//   so the other worker won't pick the same job.
 // Start: pm2 start ecosystem.config.js
 // Logs: pm2 logs
-// Restart worker only: pm2 restart worker
+// Restart worker only: pm2 restart pipeline-worker
 module.exports = {
   apps: [
     {
@@ -13,7 +18,7 @@ module.exports = {
       max_memory_restart: '300M',
       env: {
         NODE_ENV: 'production',
-        PORT: 3000,
+        PORT: 3001,   // currently used by live PM2 + videofurge nginx proxy
         // API_KEYS: 'secret-key-1,secret-key-2',
         // MAX_JOBS_PER_DAY: '3',
       },
@@ -24,7 +29,7 @@ module.exports = {
     {
       name: 'pipeline-worker',
       script: 'worker.js',
-      instances: 1,
+      instances: 2,
       autorestart: true,
       watch: false,
       max_memory_restart: '400M',

@@ -1,15 +1,17 @@
-// Long-running worker process, separate from the API (run it with pm2
-// or a systemd service, restart=always). Polls for the next queued job
-// and processes jobs ONE AT A TIME — this is the RAM-safety rule for a
-// 4GB VPS: never run two Grok CLI batches, or a whisper.cpp pass and a
-// Grok batch, concurrently.
+// Long-running worker process, separate from the API (reloaded for .env changes).
+// or a systemd service, restart=always). Polls for queued jobs using a
+// safe claim mechanism so that multiple workers (e.g. instances: 2) can
+// safely process different jobs concurrently. A worker immediately claims
+// a job (moves it out of 'queued') so no other worker will pick it.
 const fs = require('fs');
 require('dotenv').config();
 const path = require('path');
-const { nextQueuedJob, updateJob, jobDir, readJob } = require('./lib/jobStore');
+const { claimNextQueuedJob, updateJob, jobDir, readJob } = require('./lib/jobStore');
 const { transcribe } = require('./lib/transcribe');
 const { groupIntoBeats, buildPrompts, chunkIntoBatches, BEAT_SECONDS } = require('./lib/promptBuilder');
 const { getStyleSummary, runBatch } = require('./lib/grokBatch');
+const { runPreProduction } = require('./lib/preproduction');
+const { updateContinuity } = require('./lib/continuityUpdater');
 const { stitch } = require('./lib/stitch');
 const { mixAudio } = require('./lib/audioMix');
 
@@ -27,10 +29,25 @@ function logForJob(jobId, msg, extra) {
   } catch (_) { }
 }
 
+function getClipDuration(filePath) {
+  try {
+    const { execSync } = require('child_process');
+    const out = execSync(`ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${filePath}"`);
+    const d = parseFloat(out.toString().trim());
+    return isFinite(d) ? d : 10.0;
+  } catch (e) {
+    return 10.0;
+  }
+}
+
 function isRetryable(err) {
   const m = String(err && err.message || err || '').toLowerCase();
   if (m.includes('content') && m.includes('policy')) return false;
   if (m.includes('invalid prompt') || m.includes('bad input') || m.includes('refused')) return false;
+  // max-turns / non-zero exits are retryable because runBatch filters to only pending items
+  // and will succeed if side-effect files were produced on a prior attempt.
+  if (m.includes('max turn') || m.includes('max_turns') || m.includes('turns reached')) return true;
+  if (m.includes('exited 1') || m.includes('exit 1')) return true;
   return /timeout|killed|rate ?limit|429|503|502|connect|network|econn|socket|exit (1|124|137|143)/.test(m);
 }
 
@@ -44,19 +61,20 @@ function recoverInterruptedJobs() {
     if (!j) continue;
     const s = j.status;
     if (['queued', 'done', 'failed'].includes(s)) continue;
+
+    // Re-queue interrupted jobs so any available worker can pick them up.
+    // The processJob() resume logic (based on persisted segments/beats/progress)
+    // will skip stages that are already complete on disk.
     if (s === 'generating') {
-      // Re-queue at the last completed batch. runBatch skips items whose
-      // image+clip already exist on disk, so partial batches resume safely.
       const pd = j.progress || { batchesDone: 0, batchesTotal: 0 };
-      if ((pd.batchesDone || 0) < (pd.batchesTotal || 0)) {
-        updateJob(id, { status: 'queued', error: null, recovery: `auto-recovered at batch ${pd.batchesDone}` });
-        console.log(`[recover] queued ${id} to resume generating from batch ${pd.batchesDone}`);
-      } else {
-        updateJob(id, { status: 'queued' });
-      }
+      const note = (pd.batchesDone || 0) < (pd.batchesTotal || 0)
+        ? `auto-recovered at batch ${pd.batchesDone}`
+        : 'auto-recovered';
+      updateJob(id, { status: 'queued', error: null, recovery: note });
+      console.log(`[recover] queued ${id} to resume from ${note}`);
     } else {
-      updateJob(id, { status: 'failed', error: `interrupted during ${s}; resubmit to retry from start` });
-      console.log(`[recover] marked ${id} failed (was ${s})`);
+      updateJob(id, { status: 'queued', error: null, recovery: `auto-recovered from ${s}` });
+      console.log(`[recover] queued ${id} (was ${s}) for retry by available worker`);
     }
   }
 }
@@ -73,7 +91,7 @@ async function processJob(job) {
     logForJob(job.id, 'process start', { status: job.status, progress: p });
 
     // --- TRANSCRIBE (resume if already done) ---
-    if (job.segments && job.totalDurationMs && ['generating', 'stitching', 'queued'].includes(job.status)) {
+    if (job.segments && job.totalDurationMs && !['done', 'failed'].includes(job.status)) {
       segments = job.segments;
       totalDurationMs = job.totalDurationMs;
       logForJob(job.id, 'resume from persisted segments');
@@ -85,23 +103,92 @@ async function processJob(job) {
       updateJob(job.id, { segments, totalDurationMs });
     }
 
-    // --- BUILD PROMPTS (resume if already done) ---
-    if (job.styleSummary && job.beats && ['generating', 'stitching', 'queued'].includes(job.status)) {
-      styleSummary = job.styleSummary;
-      beats = job.beats;
-      logForJob(job.id, 'resume from persisted style/beats');
-    } else {
-      updateJob(job.id, { status: 'building_prompts' });
-      logForJob(job.id, 'building_prompts');
-      styleSummary = await getStyleSummary(job.referenceImagePaths, dir);
-      beats = groupIntoBeats(segments, totalDurationMs);
-      updateJob(job.id, { styleSummary, beats });
+    // --- PRE-PRODUCTION & SCREENPLAY (resume if already done) ---
+    const characters = Array.isArray(job.characters) ? job.characters : [];
+    const sceneStyle = job.sceneStyle || '';
+    const styleReferencePaths = Array.isArray(job.styleReferencePaths) ? job.styleReferencePaths : [];
+
+    updateJob(job.id, { status: 'building_prompts' });
+    logForJob(job.id, 'pre-production: screenplay & canonical refs');
+    
+    // Generates screenplay.json and populates jobs/<id>/refs/
+    const screenplay = await runPreProduction(job, dir, segments);
+    
+    // Extract and map screenplay beats strictly aligned with Whisper segments
+    beats = [];
+    const screenplayBeatsMap = new Map();
+    if (screenplay && screenplay.scenes) {
+      for (const scene of screenplay.scenes) {
+        if (scene.beats) {
+          for (const beat of scene.beats) {
+            screenplayBeatsMap.set(beat.beatIndex, {
+              ...beat,
+              sceneId: scene.sceneId,
+              location: scene.location,
+              timeOfDay: scene.timeOfDay,
+              weather: scene.weather
+            });
+          }
+        }
+      }
     }
 
-    // --- GENERATE + ANIMATE (one Grok session per batch of 20 beats) ---
-    // Each batch session generates the image AND video clip for each beat.
+    // Contiguously partition the entire audio timeline
+    for (let i = 0; i < segments.length; i++) {
+      const seg = segments[i];
+      const spBeat = screenplayBeatsMap.get(i);
+      
+      let startMs, endMs;
+      if (i === 0) {
+        startMs = 0;
+      } else {
+        startMs = beats[i - 1].endMs;
+      }
+      
+      if (i === segments.length - 1) {
+        endMs = totalDurationMs;
+      } else {
+        endMs = segments[i + 1].startMs;
+      }
+      
+      // Make sure endMs is strictly greater than startMs
+      if (endMs <= startMs) {
+        endMs = startMs + 1000;
+      }
+
+      beats.push({
+        index: i,
+        beatIndex: i,
+        startMs,
+        endMs,
+        text: seg.text.trim(),
+        narration: seg.text.trim(),
+        sceneId: spBeat ? spBeat.sceneId : 1,
+        location: spBeat ? spBeat.location : 'Unknown Location',
+        timeOfDay: spBeat ? spBeat.timeOfDay : 'Daytime',
+        weather: spBeat ? spBeat.weather : 'Clear',
+        charactersPresent: spBeat ? spBeat.charactersPresent : [],
+        characterStates: spBeat ? spBeat.characterStates : {},
+        shotType: spBeat ? spBeat.shotType : 'medium shot',
+        cameraMovement: spBeat ? spBeat.cameraMovement : 'Gentle parallax drift',
+        sfx: spBeat ? spBeat.sfx : [],
+        music: spBeat ? spBeat.music : null,
+        emergentDetails: spBeat ? spBeat.emergentDetails : null
+      });
+    }
+    
+    // To support downstream promptBuilder backward-compat
+    styleSummary = (screenplay && screenplay.productionBible && screenplay.productionBible.style) ? 
+      `STYLE CLASSIFICATION: ${screenplay.productionBible.style.styleClassification}\nMedium: ${screenplay.productionBible.style.medium}` :
+      (job.styleSummary || '');
+      
+    updateJob(job.id, { styleSummary, beats });
+
+    // --- GENERATE + ANIMATE (one Grok session per small batch of beats) ---
+    // Each batch session generates the image AND video clip for its beats.
     // runBatch skips beats that already have both files (resume-safe).
-    prompts = buildPrompts(beats, styleSummary, job.script);
+    // Small batches reduce chance of hitting --max-turns before finishing.
+    prompts = buildPrompts(beats, styleSummary, job.script, { characters, sceneStyle, styleReferencePaths, screenplay });
     batches = chunkIntoBatches(prompts);
     const totalB = batches.length;
     if (startBatch >= totalB || startBatch < 0) startBatch = 0;
@@ -117,7 +204,11 @@ async function processJob(job) {
       while (attempt < MAX_ATTEMPTS) {
         attempt++;
         try {
-          await runBatch(batches[i], styleSummary, i, dir);
+          await runBatch(batches[i], styleSummary, i, dir, { characters, sceneStyle, styleReferencePaths, screenplay });
+          // Phase 3: Post-Generation Continuity Loop
+          if (screenplay) {
+            await updateContinuity(batches[i], dir, screenplay);
+          }
           break;
         } catch (e) {
           const retryable = isRetryable(e);
@@ -148,7 +239,26 @@ async function processJob(job) {
       updateJob(job.id, { status: 'mixing_audio' });
       logForJob(job.id, 'mixing_audio');
       const outDir = path.join(dir, 'output');
-      mixedAudioPath = await mixAudio(job.mediaPath, beats, outDir);
+      
+      // Calculate actedBeats using actual generated clip durations on disk
+      const actedBeats = [];
+      let currentMs = 0;
+      for (let i = 0; i < beats.length; i++) {
+        const b = beats[i];
+        const clipFile = path.join(dir, 'output', 'videoclips', `clip_${String(i).padStart(4, '0')}.mp4`);
+        const durSecs = fs.existsSync(clipFile) ? getClipDuration(clipFile) : ((b.endMs - b.startMs) / 1000);
+        const startMs = currentMs;
+        const endMs = startMs + Math.round(durSecs * 1000);
+        currentMs = endMs;
+        
+        actedBeats.push({
+          ...b,
+          startMs,
+          endMs
+        });
+      }
+      
+      mixedAudioPath = await mixAudio(job.mediaPath, beats, outDir, actedBeats);
       logForJob(job.id, 'mixing_audio done', { mixedAudio: mixedAudioPath });
     } catch (mixErr) {
       // Non-fatal: log warning and continue with raw voiceover
@@ -170,8 +280,19 @@ async function processJob(job) {
 }
 
 async function loop() {
-  const job = nextQueuedJob();
+  // Jitter to desynchronize multiple workers and reduce simultaneous claim races
+  // (especially right after startup when recover runs in all workers).
+  await new Promise(r => setTimeout(r, 50 + Math.random() * 300));
+
+  const job = claimNextQueuedJob();
   if (job) {
+    // Extra verification after claim (defends against races at startup etc.)
+    const verify = readJob(job.id);
+    if (!verify || verify.status !== 'transcribing' || verify.claimedBy !== job.claimedBy) {
+      logForJob(job.id || 'unknown', 'lost claim race after picking, skipping');
+      setTimeout(loop, POLL_INTERVAL_MS);
+      return;
+    }
     logForJob(job.id, `picked for processing${job.recovery ? ' (recovered)' : ''}`);
     await processJob(job);
   }

@@ -60,13 +60,18 @@ node worker.js
 ## API usage (authenticated)
 
 ```bash
+# Modern usage (recommended)
 curl -X POST http://.../api/jobs \
   -H "X-API-Key: $KEY" \
   -F "title=My Video" \
   -F "script=..." \
   -F "media=@input.mp4" \
-  -F "referenceImages=@char1.png" \
-  -F "referenceImages=@char2.png"
+  -F "characters=[{\"name\":\"Alice\",\"gender\":\"female\"}]" \
+  -F "characterImages=@alice.png" \
+  -F "characterImages=@bob.png"
+
+# Legacy (still supported)
+# -F "referenceImages=@char1.png" -F "referenceImages=@char2.png"
 ```
 
 Poll `GET /api/jobs/:id` (includes `progress.step`, `progress.batch`, `progress.etaSeconds`).
@@ -87,6 +92,8 @@ Downloads when `status=done`.
 
 - Caddy (easiest LE): see `Caddyfile.example`
 - nginx: see `nginx.conf.example` + certbot
+
+Production example domain used in configs: `videofurge.voiceforgeai.site` (update to match your DNS).
 
 Example systemd units are simple `Restart=always` wrappers around the pm2 or direct node commands.
 
@@ -142,7 +149,7 @@ node server.js   # API + Socket.IO + static frontend all on one port (default: 3
 node worker.js   # unchanged — separate process, pm2 restart=always
 ```
 
-Open `http://localhost:3000` — the gear icon (⚙) in the top-right corner lets you enter the API key.
+Open `http://localhost:3000` (or your production URL e.g. https://videofurge.voiceforgeai.site) — the gear icon (⚙) in the top-right corner lets you enter the API key.
 
 ### Auth
 
@@ -173,7 +180,7 @@ The frontend connects via Socket.IO on the same port as the API. No extra port o
 
 1. **Jobs list** (`/`) — all jobs for your API key, live-updated via socket.
 2. **New Job** (`/new`) — form with client-side validation, multipart upload with progress bar,
-   media duration preview, reference image thumbnail grid (1–20 images, removable).
+   media duration preview, character photo uploads + optional style references.
 3. **Job detail** (`/jobs/:id`) — 6-step progress indicator (queued → transcribing →
    building_prompts → generating [batch X/Y] → stitching → done), live-updated via socket.
    Shows a video player + download buttons once done. Delete button with confirmation dialog.

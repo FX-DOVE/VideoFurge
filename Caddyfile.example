@@ -2,9 +2,9 @@
 # Place at /etc/caddy/Caddyfile or alongside, adapt domain + port.
 # Caddy is lightweight and great on small VPS.
 
-your-domain.example.com {
+videofurge.voiceforgeai.site {
     # Optional: basic rate limit at proxy too
-    reverse_proxy localhost:3000
+    reverse_proxy localhost:3001   # or whatever PORT you run the server on (default 3000, current PM2 uses 3001)
 
     # Logging
     log {
