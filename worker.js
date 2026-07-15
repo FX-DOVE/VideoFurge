@@ -6,7 +6,7 @@
 const fs = require('fs');
 require('dotenv').config();
 const path = require('path');
-const { claimNextQueuedJob, updateJob, jobDir, readJob } = require('./lib/jobStore');
+const { claimNextQueuedJob, claimNextEditRenderJob, updateJob, jobDir, readJob } = require('./lib/jobStore');
 const { transcribe } = require('./lib/transcribe');
 const { groupIntoBeats, buildPrompts, chunkIntoBatches, BEAT_SECONDS } = require('./lib/promptBuilder');
 const { getStyleSummary, runBatch } = require('./lib/grokBatch');
@@ -14,6 +14,7 @@ const { runPreProduction } = require('./lib/preproduction');
 const { updateContinuity } = require('./lib/continuityUpdater');
 const { stitch } = require('./lib/stitch');
 const { mixAudio } = require('./lib/audioMix');
+const { renderEditedVideo } = require('./lib/editorRender');
 
 const POLL_INTERVAL_MS = 5000;
 console.log("worker is running");
@@ -60,6 +61,22 @@ function recoverInterruptedJobs() {
     try { j = readJob(id); } catch (_) { continue; }
     if (!j) continue;
     const s = j.status;
+
+    // Re-queue interrupted edit renders (job stays "done")
+    if (s === 'done' && j.editRender && j.editRender.status === 'rendering') {
+      updateJob(id, {
+        editRender: {
+          ...j.editRender,
+          status: 'queued',
+          error: null,
+          claimedBy: null,
+          progress: { phase: 'queued', done: 0, total: j.editRender.progress?.total || 0 },
+        },
+      });
+      console.log(`[recover] re-queued edit render for ${id}`);
+      continue;
+    }
+
     if (['queued', 'done', 'failed'].includes(s)) continue;
 
     // Re-queue interrupted jobs so any available worker can pick them up.
@@ -76,6 +93,54 @@ function recoverInterruptedJobs() {
       updateJob(id, { status: 'queued', error: null, recovery: `auto-recovered from ${s}` });
       console.log(`[recover] queued ${id} (was ${s}) for retry by available worker`);
     }
+  }
+}
+
+async function processEditRender(job) {
+  const dir = jobDir(job.id);
+  logForJob(job.id, 'edit render starting');
+  try {
+    const timeline = job.editTimeline || null;
+    await renderEditedVideo({
+      jobDir: dir,
+      job,
+      timeline,
+      onProgress: (p) => {
+        try {
+          const cur = readJob(job.id);
+          if (!cur?.editRender || cur.editRender.status !== 'rendering') return;
+          updateJob(job.id, {
+            editRender: {
+              ...cur.editRender,
+              progress: p,
+            },
+          });
+        } catch (_) {}
+      },
+    });
+
+    const cur = readJob(job.id);
+    updateJob(job.id, {
+      editRender: {
+        ...(cur?.editRender || {}),
+        status: 'done',
+        finishedAt: new Date().toISOString(),
+        error: null,
+        progress: { phase: 'done', done: 1, total: 1 },
+      },
+    });
+    logForJob(job.id, 'edit render done');
+  } catch (err) {
+    const cur = readJob(job.id);
+    updateJob(job.id, {
+      editRender: {
+        ...(cur?.editRender || {}),
+        status: 'failed',
+        finishedAt: new Date().toISOString(),
+        error: String(err && err.message || err),
+      },
+    });
+    logForJob(job.id, 'edit render FAILED', { error: String(err && err.message || err) });
   }
 }
 
@@ -284,6 +349,7 @@ async function loop() {
   // (especially right after startup when recover runs in all workers).
   await new Promise(r => setTimeout(r, 50 + Math.random() * 300));
 
+  // Prefer full pipeline jobs first, then user edit re-renders
   const job = claimNextQueuedJob();
   if (job) {
     // Extra verification after claim (defends against races at startup etc.)
@@ -295,6 +361,12 @@ async function loop() {
     }
     logForJob(job.id, `picked for processing${job.recovery ? ' (recovered)' : ''}`);
     await processJob(job);
+  } else {
+    const editJob = claimNextEditRenderJob();
+    if (editJob) {
+      logForJob(editJob.id, 'picked for edit render');
+      await processEditRender(editJob);
+    }
   }
   setTimeout(loop, POLL_INTERVAL_MS);
 }

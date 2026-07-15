@@ -151,6 +151,7 @@ function getJobAssets(job) {
     video:  exists('final.mp4'),
     acted:  exists('acted.mp4'),
     concat: exists('concat-video.mp4'),
+    edited: exists('edited.mp4'),
     images: exists('images.zip')
       || fs.existsSync(path.join(out, 'images'))
       || fs.existsSync(path.join(out, 'videoclips')),
@@ -160,7 +161,10 @@ function getJobAssets(job) {
 // Strip filesystem paths and heavy computed fields before sending to clients.
 function stripSafe(job) {
   if (!job) return null;
-  const { mediaPath, referenceImagePaths, segments, beats, styleSummary, apiKey, script, styleReferencePaths, ...rest } = job;
+  const {
+    mediaPath, referenceImagePaths, segments, beats, styleSummary, apiKey, script,
+    styleReferencePaths, editTimeline, ...rest
+  } = job;
 
   // Sanitize characters: keep useful info for UI, remove disk paths
   if (Array.isArray(rest.characters)) {
@@ -170,6 +174,20 @@ function stripSafe(job) {
     }));
   }
   rest.assets = getJobAssets(job);
+
+  // Expose lightweight edit-render status (no full timeline dump on every poll)
+  if (job.editRender) {
+    rest.editRender = {
+      status: job.editRender.status || null,
+      error: job.editRender.error || null,
+      progress: job.editRender.progress || null,
+      queuedAt: job.editRender.queuedAt || null,
+      startedAt: job.editRender.startedAt || null,
+      finishedAt: job.editRender.finishedAt || null,
+    };
+  } else {
+    delete rest.editRender;
+  }
   return rest;
 }
 
@@ -360,6 +378,153 @@ app.get('/api/jobs/:id', (req, res, next) => {
   }
 });
 
+// GET /api/jobs/:id/editor — clip list + saved timeline + render status
+app.get('/api/jobs/:id/editor', (req, res, next) => {
+  try {
+    const job = readJob(req.params.id);
+    if (!job) return res.status(404).json({ error: 'not found' });
+    if (job.status !== 'done') {
+      return res.status(400).json({ error: 'Job must be finished before editing clips' });
+    }
+
+    const { listJobClips, defaultTimeline, normalizeTimeline } = require('./lib/editorRender');
+    const dir = jobDir(job.id);
+    const sourceClips = listJobClips(dir, job).map(c => ({
+      index: c.index,
+      name: c.name,
+      duration: c.duration,
+      text: c.text,
+      startMs: c.startMs,
+      endMs: c.endMs,
+      url: `/api/jobs/${job.id}/preview/clip/${c.index}`,
+    }));
+
+    if (sourceClips.length === 0) {
+      return res.status(404).json({ error: 'No video clips found for this job' });
+    }
+
+    let timeline = job.editTimeline || null;
+    // Prefer last saved timeline on disk if job field missing
+    if (!timeline) {
+      const diskPath = path.join(dir, 'output', 'edit_timeline.json');
+      if (fs.existsSync(diskPath)) {
+        try { timeline = JSON.parse(fs.readFileSync(diskPath, 'utf8')); } catch (_) {}
+      }
+    }
+    const clipsMeta = listJobClips(dir, job);
+    timeline = timeline
+      ? normalizeTimeline(timeline, clipsMeta)
+      : defaultTimeline(clipsMeta);
+
+    res.json({
+      jobId: job.id,
+      title: job.title,
+      clips: sourceClips,
+      timeline,
+      editRender: job.editRender ? {
+        status: job.editRender.status,
+        error: job.editRender.error || null,
+        progress: job.editRender.progress || null,
+        queuedAt: job.editRender.queuedAt || null,
+        startedAt: job.editRender.startedAt || null,
+        finishedAt: job.editRender.finishedAt || null,
+      } : { status: 'idle' },
+      assets: getJobAssets(job),
+      transitions: ['none', 'fade', 'dissolve', 'fadeblack', 'slideleft', 'slideright'],
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// PUT /api/jobs/:id/editor — save timeline (auto-save / before render)
+app.put('/api/jobs/:id/editor', (req, res, next) => {
+  try {
+    const job = readJob(req.params.id);
+    if (!job) return res.status(404).json({ error: 'not found' });
+    if (job.status !== 'done') {
+      return res.status(400).json({ error: 'Job must be finished before editing' });
+    }
+    if (job.editRender && ['queued', 'rendering'].includes(job.editRender.status)) {
+      return res.status(409).json({ error: 'Cannot edit timeline while a render is in progress' });
+    }
+
+    const { listJobClips, normalizeTimeline } = require('./lib/editorRender');
+    const dir = jobDir(job.id);
+    const clipsMeta = listJobClips(dir, job);
+    const timeline = normalizeTimeline(req.body?.timeline || req.body, clipsMeta);
+
+    const updated = updateJob(job.id, { editTimeline: timeline });
+    try {
+      fs.writeFileSync(
+        path.join(dir, 'output', 'edit_timeline.json'),
+        JSON.stringify(timeline, null, 2),
+        'utf8'
+      );
+    } catch (_) {}
+
+    res.json({ ok: true, timeline: updated.editTimeline });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /api/jobs/:id/editor/render — queue server-side re-render (works offline after)
+app.post('/api/jobs/:id/editor/render', (req, res, next) => {
+  try {
+    const job = readJob(req.params.id);
+    if (!job) return res.status(404).json({ error: 'not found' });
+    if (job.status !== 'done') {
+      return res.status(400).json({ error: 'Job must be finished before rendering an edit' });
+    }
+    if (job.editRender && ['queued', 'rendering'].includes(job.editRender.status)) {
+      return res.status(409).json({ error: 'A render is already in progress for this job' });
+    }
+
+    const { listJobClips, normalizeTimeline } = require('./lib/editorRender');
+    const dir = jobDir(job.id);
+    const clipsMeta = listJobClips(dir, job);
+    if (clipsMeta.length === 0) {
+      return res.status(404).json({ error: 'No video clips found for this job' });
+    }
+
+    const bodyTimeline = req.body?.timeline || job.editTimeline || null;
+    const timeline = normalizeTimeline(bodyTimeline, clipsMeta);
+    const enabledCount = timeline.clips.filter(c => c.enabled !== false).length;
+    if (enabledCount === 0) {
+      return res.status(400).json({ error: 'Enable at least one clip before rendering' });
+    }
+
+    const editRender = {
+      status: 'queued',
+      queuedAt: new Date().toISOString(),
+      startedAt: null,
+      finishedAt: null,
+      error: null,
+      progress: { phase: 'queued', done: 0, total: enabledCount },
+      claimedBy: null,
+    };
+
+    updateJob(job.id, { editTimeline: timeline, editRender });
+    try {
+      fs.writeFileSync(
+        path.join(dir, 'output', 'edit_timeline.json'),
+        JSON.stringify(timeline, null, 2),
+        'utf8'
+      );
+    } catch (_) {}
+
+    res.status(202).json({
+      ok: true,
+      jobId: job.id,
+      editRender,
+      message: 'Edit render queued. You can close this tab and download later.',
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
 // GET /api/jobs/:id/download/:asset — download as attachment
 app.get('/api/jobs/:id/download/:asset', async (req, res, next) => {
   try {
@@ -369,6 +534,7 @@ app.get('/api/jobs/:id/download/:asset', async (req, res, next) => {
       video:  path.join(jobDir(job.id), 'output', 'final.mp4'),
       acted:  path.join(jobDir(job.id), 'output', 'acted.mp4'),
       concat: path.join(jobDir(job.id), 'output', 'concat-video.mp4'),
+      edited: path.join(jobDir(job.id), 'output', 'edited.mp4'),
       images: path.join(jobDir(job.id), 'output', 'images.zip'),
     };
     let file = targets[req.params.asset];
@@ -416,6 +582,36 @@ app.get('/api/jobs/:id/download/:asset', async (req, res, next) => {
   }
 });
 
+// GET /api/jobs/:id/preview/clip/:index — stream a single source clip for the editor
+app.get('/api/jobs/:id/preview/clip/:index', (req, res, next) => {
+  try {
+    const job = readJob(req.params.id);
+    if (!job || job.status !== 'done') return res.status(404).json({ error: 'not ready' });
+
+    const idx = parseInt(req.params.index, 10);
+    if (!Number.isInteger(idx) || idx < 0 || idx > 9999) {
+      return res.status(400).json({ error: 'invalid clip index' });
+    }
+
+    const file = path.resolve(
+      path.join(jobDir(job.id), 'output', 'videoclips', `clip_${String(idx).padStart(4, '0')}.mp4`)
+    );
+    if (!fs.existsSync(file)) return res.status(404).json({ error: 'clip not found' });
+
+    res.setHeader('Content-Type', 'video/mp4');
+    res.setHeader('Accept-Ranges', 'bytes');
+    res.setHeader('Cache-Control', 'private, max-age=3600');
+    res.sendFile(file, {
+      acceptRanges: true,
+      headers: { 'Content-Type': 'video/mp4' },
+    }, (err) => {
+      if (err && !res.headersSent) next(err);
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
 // GET /api/jobs/:id/preview/:asset — inline video stream for <video src>.
 // Uses res.sendFile so browsers can play inline and range-request for scrubbing.
 // Auth: also accepts ?k= query param because <video> cannot send custom headers.
@@ -427,6 +623,7 @@ app.get('/api/jobs/:id/preview/:asset', (req, res, next) => {
     let filename;
     if (req.params.asset === 'video') filename = 'final.mp4';
     else if (req.params.asset === 'acted') filename = 'acted.mp4';
+    else if (req.params.asset === 'edited') filename = 'edited.mp4';
     else return res.status(404).json({ error: 'asset not found' });
 
     const file = path.resolve(path.join(jobDir(job.id), 'output', filename));

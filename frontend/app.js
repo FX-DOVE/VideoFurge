@@ -12,6 +12,8 @@ const STATUS_LABELS = {
   stitching:        'Stitching',
   done:             'Done',
   failed:           'Failed',
+  // edit render statuses (nested under job.editRender)
+  rendering:        'Rendering edit',
 };
 
 const STATUS_STEPS = ['queued', 'transcribing', 'building_prompts', 'generating', 'mixing_audio', 'stitching', 'done'];
@@ -238,10 +240,14 @@ function initSocket() {
     Router.refresh();
   });
 
-  // Real-time update for the job currently shown in detail view
+  // Real-time update for the job currently shown in detail or editor view
   socket.on('job:update', (job) => {
     if (job?.id && job.id === _currentJobSub) {
-      _applyJobDetailUpdate(job);
+      if (Router._current?.type === 'editor') {
+        _applyEditorJobUpdate(job);
+      } else {
+        _applyJobDetailUpdate(job);
+      }
     }
   });
 
@@ -272,7 +278,10 @@ const Router = {
   navigate(hash) {
     const raw = (hash || '#/').replace(/^#/, '') || '/';
     // Teardown: leave job detail room on navigate-away
-    if (this._current?.type === 'detail') _unsubscribeFromJob();
+    if (this._current?.type === 'detail' || this._current?.type === 'editor') {
+      _unsubscribeFromJob();
+      _teardownEditor();
+    }
     this._current = null;
 
     if (raw === '/' || raw === '/jobs') {
@@ -282,6 +291,12 @@ const Router = {
       this._current = { type: 'new' };
       _renderNewJob();
     } else {
+      const editorMatch = raw.match(/^\/jobs\/([a-zA-Z0-9-]+)\/editor$/);
+      if (editorMatch) {
+        this._current = { type: 'editor', jobId: editorMatch[1] };
+        _renderEditor(editorMatch[1]);
+        return;
+      }
       const m = raw.match(/^\/jobs\/([a-zA-Z0-9-]+)$/);
       if (m) {
         this._current = { type: 'detail', jobId: m[1] };
@@ -1112,15 +1127,34 @@ function _paintJobDetail(job) {
       <p class="error-hint">Acted video was not generated for this job (file missing). Download Final instead, or re-run the job.</p>`}
 
       <div class="download-actions" style="margin-top: 1.5rem; display: flex; gap: 0.5rem; flex-wrap: wrap;">
+        <a href="#/jobs/${job.id}/editor" class="btn btn-primary" id="btn-open-editor">
+          ✂ Edit Clips
+        </a>
         ${assets.video !== false ? `<a href="${escAttr(mediaUrl(`/api/jobs/${job.id}/download/video`))}"
-          class="btn btn-primary" download>⬇ Download Final Video (Voice + BGM + SFX)</a>` : ''}
+          class="btn btn-secondary" download>⬇ Download Final Video (Voice + BGM + SFX)</a>` : ''}
         ${assets.acted !== false ? `<a href="${escAttr(mediaUrl(`/api/jobs/${job.id}/download/acted`))}"
           class="btn btn-secondary" download>⬇ Download Acted Video (BGM + SFX, no Voice)</a>` : ''}
+        ${assets.edited ? `<a href="${escAttr(mediaUrl(`/api/jobs/${job.id}/download/edited`))}"
+          class="btn btn-primary" download>⬇ Download Edited Video</a>` : ''}
         ${assets.concat !== false ? `<a href="${escAttr(mediaUrl(`/api/jobs/${job.id}/download/concat`))}"
           class="btn btn-ghost" download>⬇ Download Stitched Video (No Audio)</a>` : ''}
         ${assets.images !== false ? `<a href="${escAttr(mediaUrl(`/api/jobs/${job.id}/download/images`))}"
           class="btn btn-ghost" download>⬇ Download CapCut Assets (ZIP)</a>` : ''}
       </div>
+      ${_editRenderBannerHtml(job)}
+      ${assets.edited ? `
+      <h2 class="card-section-title" style="margin-top: 2rem;">✂ Your Edited Version</h2>
+      <div class="video-player-wrap" data-player="edited">
+        <video id="result-edited-video" class="result-video" controls playsinline
+          preload="metadata" src="${escAttr(mediaUrl(`/api/jobs/${job.id}/preview/edited`))}">
+        </video>
+        <div class="video-toolbar">
+          <button type="button" class="btn btn-primary" data-play-for="result-edited-video">▶ Play / Pause</button>
+          <button type="button" class="btn btn-ghost" data-reload-for="result-edited-video">↻ Reload</button>
+          <span class="video-status" id="status-result-edited-video">Ready</span>
+        </div>
+        <div class="video-error hidden" id="result-edited-video-error"></div>
+      </div>` : ''}
     </div>` : '';
 
   const errorSection = isFailed ? `
@@ -1243,6 +1277,38 @@ function _paintJobDetail(job) {
   // when a parent uses overflow:hidden / stacking quirks).
   _wireVideoPlayer('result-video', 'result-video-error', 'Final');
   _wireVideoPlayer('result-acted-video', 'result-acted-video-error', 'Acted');
+  _wireVideoPlayer('result-edited-video', 'result-edited-video-error', 'Edited');
+}
+
+function _editRenderBannerHtml(job) {
+  const er = job.editRender;
+  if (!er || !er.status || er.status === 'idle') return '';
+  if (er.status === 'queued' || er.status === 'rendering') {
+    const phase = er.progress?.phase || er.status;
+    const done = er.progress?.done ?? 0;
+    const total = er.progress?.total ?? 0;
+    const detail = total ? ` — ${done}/${total}` : '';
+    return `
+      <div class="edit-render-banner edit-render-busy" style="margin-top:1rem;">
+        <strong>Re-render in progress</strong>
+        <span>(${escHtml(phase)}${escHtml(detail)}). You can leave this page — come back later to download.</span>
+        <a href="#/jobs/${job.id}/editor" class="btn btn-sm btn-secondary" style="margin-left:0.5rem;">Open Editor</a>
+      </div>`;
+  }
+  if (er.status === 'failed') {
+    return `
+      <div class="edit-render-banner edit-render-failed" style="margin-top:1rem;">
+        <strong>Edit render failed:</strong> ${escHtml(er.error || 'Unknown error')}
+        <a href="#/jobs/${job.id}/editor" class="btn btn-sm btn-secondary" style="margin-left:0.5rem;">Fix in Editor</a>
+      </div>`;
+  }
+  if (er.status === 'done') {
+    return `
+      <div class="edit-render-banner edit-render-done" style="margin-top:1rem;">
+        <strong>Edit render complete.</strong> Download your edited video above, or open the editor to tweak further.
+      </div>`;
+  }
+  return '';
 }
 
 function _setVideoStatus(videoId, text) {
@@ -1367,6 +1433,18 @@ function _applyJobDetailUpdate(job) {
   const titleEl = document.getElementById('d-title');
   if (titleEl) titleEl.textContent = job.title;
 
+  // Refresh edit-render banner / edited download without nuking video players
+  if (job.status === 'done' && job.editRender) {
+    const bannerHost = document.getElementById('d-video-card');
+    if (bannerHost && !document.getElementById('ed-video')) {
+      // Soft refresh when edit render completes so Download Edited appears
+      if (job.editRender.status === 'done' && job.assets?.edited && !document.getElementById('result-edited-video')) {
+        _paintJobDetail(job);
+        return;
+      }
+    }
+  }
+
   if (job.status === 'done' || job.status === 'failed') {
     // Do NOT full-repaint if the terminal UI is already showing — destroying <video>
     // elements mid-load/play is a common reason the second (acted) player never works.
@@ -1399,6 +1477,12 @@ function _applyJobDetailUpdate(job) {
     }
   }
 }
+
+
+// =============================================================
+// CLIP EDITOR — CapCut-style UI lives in editor.js (loaded after app.js)
+// Provides: _teardownEditor, _renderEditor, _applyEditorJobUpdate
+// =============================================================
 
 // =============================================================
 // INIT
