@@ -125,17 +125,18 @@ function closeModal() {
 }
 
 // Confirmation dialog (irreversible actions)
-function showConfirm(title, message, onConfirm) {
+function showConfirm(title, message, onConfirm, confirmText = 'Confirm', isDanger = false) {
+  const btnClass = isDanger ? 'btn-danger' : 'btn-primary';
   openModal(`
     <div class="modal-header">
       <h2 class="modal-title">${escHtml(title)}</h2>
     </div>
     <div class="modal-body">
-      <p>${escHtml(message)}</p>
+      <p>${escHtml(message).replace(/\n/g, '<br/>')}</p>
     </div>
     <div class="modal-footer">
       <button class="btn btn-ghost" id="modal-cancel">Cancel</button>
-      <button class="btn btn-danger" id="modal-confirm">Delete</button>
+      <button class="btn ${btnClass}" id="modal-confirm">${escHtml(confirmText)}</button>
     </div>
   `);
   document.getElementById('modal-cancel').onclick = closeModal;
@@ -484,7 +485,9 @@ function _paintJobsList() {
         } catch (err) {
           showToast(`Delete failed: ${err.message}`, 'error');
         }
-      }
+      },
+      'Delete',
+      true
     );
   });
 }
@@ -498,6 +501,21 @@ function _jobCardHtml(job) {
         <span class="progress-text">Batch ${job.progress.batchesDone}/${job.progress.batchesTotal}</span>
       </div>` : '';
 
+  const er = job.editRender;
+  const editBusy = er && (er.status === 'queued' || er.status === 'rendering');
+  const editDone = er && er.status === 'done' && job.assets?.edited;
+  const editPct = editBusy ? _editRenderPercent(er) : 0;
+  const editProgress = editBusy
+    ? `<div class="job-progress">
+        <div class="progress-bar-mini">
+          <div class="progress-bar-fill" style="width:${editPct}%"></div>
+        </div>
+        <span class="progress-text">Edit render ${editPct}% · ${_editRenderPhaseLabel(er.progress?.phase || er.status)}</span>
+      </div>`
+    : (editDone
+      ? `<div class="job-progress"><span class="progress-text" style="color:#6ee7b7;">Edited video ready to download</span></div>`
+      : '');
+
   const errorRow = job.error
     ? `<div class="job-card-error">${escHtml(job.error)}</div>` : '';
 
@@ -510,9 +528,10 @@ function _jobCardHtml(job) {
         </div>
         <div class="job-card-meta">${fmtDate(job.createdAt)} · ${fmtRelative(job.createdAt)}</div>
       </div>
-      ${genProgress}${errorRow}
+      ${genProgress}${editProgress}${errorRow}
       <div class="job-card-actions">
         <a href="#/jobs/${job.id}" class="btn btn-sm btn-secondary">View</a>
+        ${editDone ? `<a href="${escAttr(mediaUrl(`/api/jobs/${job.id}/download/edited`))}" class="btn btn-sm btn-primary" download>⬇ Edited</a>` : ''}
         <button class="btn btn-sm btn-danger-ghost" data-delete-job="${job.id}">Delete</button>
       </div>
     </div>`;
@@ -1140,8 +1159,12 @@ function _paintJobDetail(job) {
           class="btn btn-ghost" download>⬇ Download Stitched Video (No Audio)</a>` : ''}
         ${assets.images !== false ? `<a href="${escAttr(mediaUrl(`/api/jobs/${job.id}/download/images`))}"
           class="btn btn-ghost" download>⬇ Download CapCut Assets (ZIP)</a>` : ''}
+        <a href="${escAttr(mediaUrl(`/api/jobs/${job.id}/download/transcript`))}"
+          class="btn btn-ghost" download>📝 Download Transcript (TXT)</a>
       </div>
-      ${_editRenderBannerHtml(job)}
+      <div id="d-edit-render-slot" data-er-status="${escAttr(job.editRender?.status || '')}">
+        ${_editRenderBannerHtml(job)}
+      </div>
       ${assets.edited ? `
       <h2 class="card-section-title" style="margin-top: 2rem;">✂ Your Edited Version</h2>
       <div class="video-player-wrap" data-player="edited">
@@ -1259,7 +1282,9 @@ function _paintJobDetail(job) {
         } catch (err) {
           showToast(`Delete failed: ${err.message}`, 'error');
         }
-      }
+      },
+      'Delete',
+      true
     );
   });
 
@@ -1287,25 +1312,42 @@ function _editRenderBannerHtml(job) {
     const phase = er.progress?.phase || er.status;
     const done = er.progress?.done ?? 0;
     const total = er.progress?.total ?? 0;
-    const detail = total ? ` — ${done}/${total}` : '';
+    const pct = _editRenderPercent(er);
+    const phaseLabel = _editRenderPhaseLabel(phase);
+    const clipInfo = total ? `${done}/${total} clips` : 'starting…';
     return `
-      <div class="edit-render-banner edit-render-busy" style="margin-top:1rem;">
-        <strong>Re-render in progress</strong>
-        <span>(${escHtml(phase)}${escHtml(detail)}). You can leave this page — come back later to download.</span>
-        <a href="#/jobs/${job.id}/editor" class="btn btn-sm btn-secondary" style="margin-left:0.5rem;">Open Editor</a>
+      <div class="edit-render-banner edit-render-busy edit-render-banner-progress" data-er-status="${escAttr(er.status)}">
+        <div class="edit-render-progress-head">
+          <strong>🎬 Rendering edited video on server…</strong>
+          <span class="edit-render-pct">${pct}%</span>
+        </div>
+        <div class="edit-render-progress-track" role="progressbar" aria-valuenow="${pct}" aria-valuemin="0" aria-valuemax="100">
+          <div class="edit-render-progress-fill" style="width:${pct}%"></div>
+        </div>
+        <div class="edit-render-progress-meta">
+          <span>${escHtml(phaseLabel)}${total ? ` · ${escHtml(clipInfo)}` : ''}</span>
+          <span>
+            Safe to leave — worker keeps going
+            <a href="#/jobs/${job.id}/editor" class="btn btn-sm btn-secondary" style="margin-left:0.5rem;">Open Editor</a>
+          </span>
+        </div>
       </div>`;
   }
   if (er.status === 'failed') {
     return `
-      <div class="edit-render-banner edit-render-failed" style="margin-top:1rem;">
-        <strong>Edit render failed:</strong> ${escHtml(er.error || 'Unknown error')}
+      <div class="edit-render-banner edit-render-failed" data-er-status="failed">
+        <strong>❌ Edit render failed:</strong> ${escHtml(er.error || 'Unknown error')}
         <a href="#/jobs/${job.id}/editor" class="btn btn-sm btn-secondary" style="margin-left:0.5rem;">Fix in Editor</a>
       </div>`;
   }
   if (er.status === 'done') {
     return `
-      <div class="edit-render-banner edit-render-done" style="margin-top:1rem;">
-        <strong>Edit render complete.</strong> Download your edited video above, or open the editor to tweak further.
+      <div class="edit-render-banner edit-render-done" data-er-status="done">
+        <div>
+          <strong>🎉 Edit render complete!</strong>
+          <span style="display:block; font-size:0.85rem; color:rgba(255,255,255,0.7); margin-top:0.25rem;">Your edited video is ready — download or preview below.</span>
+        </div>
+        <a class="btn btn-sm btn-primary" href="${escAttr(mediaUrl(`/api/jobs/${job.id}/download/edited`))}" download style="background:#10b981; border-color:#10b981; color:white;">⬇ Download Edited Video</a>
       </div>`;
   }
   return '';
@@ -1426,6 +1468,35 @@ function _wireVideoPlayer(videoId, errorId, label) {
   }
 }
 
+// Normalize edit-render progress into a 0–100 percentage for UI bars.
+function _editRenderPercent(er) {
+  if (!er) return 0;
+  if (er.status === 'done') return 100;
+  if (er.status === 'queued') return Math.max(0, Number(er.progress?.percent) || 0);
+  const p = er.progress || {};
+  if (typeof p.percent === 'number' && isFinite(p.percent)) {
+    return Math.max(0, Math.min(100, Math.round(p.percent)));
+  }
+  if (p.total) {
+    return Math.min(100, Math.round(100 * (p.done || 0) / p.total));
+  }
+  return er.status === 'rendering' ? 45 : 10;
+}
+
+function _editRenderPhaseLabel(phase) {
+  const map = {
+    queued: 'Queued — waiting for worker',
+    prepare: 'Preparing clips',
+    concat: 'Stitching clips',
+    xfade: 'Applying transitions',
+    mux: 'Mixing audio & encoding',
+    finalize: 'Finalizing file',
+    done: 'Complete',
+    rendering: 'Rendering',
+  };
+  return map[phase] || phase || 'Working';
+}
+
 // Called by socket 'job:update' event — partial in-place DOM update for active jobs.
 // When the job reaches a terminal state (done/failed), does a full repaint once.
 function _applyJobDetailUpdate(job) {
@@ -1433,15 +1504,47 @@ function _applyJobDetailUpdate(job) {
   const titleEl = document.getElementById('d-title');
   if (titleEl) titleEl.textContent = job.title;
 
-  // Refresh edit-render banner / edited download without nuking video players
+  // Live edit-render progress while the main job is already "done"
   if (job.status === 'done' && job.editRender) {
-    const bannerHost = document.getElementById('d-video-card');
-    if (bannerHost && !document.getElementById('ed-video')) {
-      // Soft refresh when edit render completes so Download Edited appears
-      if (job.editRender.status === 'done' && job.assets?.edited && !document.getElementById('result-edited-video')) {
+    const er = job.editRender;
+    const bannerSlot = document.getElementById('d-edit-render-slot');
+    const prevStatus = bannerSlot?.dataset?.erStatus || '';
+
+    // Full repaint when render finishes so Download + edited player appear
+    if (er.status === 'done') {
+      if (prevStatus !== 'done' || (job.assets?.edited && !document.getElementById('result-edited-video'))) {
         _paintJobDetail(job);
         return;
       }
+      // Already showing done UI — nothing else to update
+      return;
+    }
+
+    // Update banner on failure transition (no need to destroy video players)
+    if (er.status === 'failed' && prevStatus !== 'failed') {
+      const html = `<div id="d-edit-render-slot" data-er-status="failed">${_editRenderBannerHtml(job)}</div>`;
+      if (bannerSlot) {
+        bannerSlot.outerHTML = html;
+      } else {
+        _paintJobDetail(job);
+      }
+      return;
+    }
+
+    // Incremental progress updates while queued/rendering (do not destroy <video> players)
+    if (er.status === 'queued' || er.status === 'rendering') {
+      const html = `<div id="d-edit-render-slot" data-er-status="${escAttr(er.status)}">${_editRenderBannerHtml(job)}</div>`;
+      if (bannerSlot) {
+        bannerSlot.outerHTML = html;
+      } else {
+        const actions = document.querySelector('#d-video-card .download-actions');
+        if (actions) {
+          actions.insertAdjacentHTML('afterend', html);
+        } else if (!document.getElementById('d-video-card')) {
+          _paintJobDetail(job);
+        }
+      }
+      return;
     }
   }
 

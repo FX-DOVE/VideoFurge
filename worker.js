@@ -70,7 +70,12 @@ function recoverInterruptedJobs() {
           status: 'queued',
           error: null,
           claimedBy: null,
-          progress: { phase: 'queued', done: 0, total: j.editRender.progress?.total || 0 },
+          progress: {
+            phase: 'queued',
+            done: 0,
+            total: j.editRender.progress?.total || 0,
+            percent: 0,
+          },
         },
       });
       console.log(`[recover] re-queued edit render for ${id}`);
@@ -120,13 +125,22 @@ async function processEditRender(job) {
     });
 
     const cur = readJob(job.id);
+    const totalClips = cur?.editRender?.progress?.total
+      || (Array.isArray(cur?.editTimeline?.clips)
+        ? cur.editTimeline.clips.filter(c => c.enabled !== false).length
+        : 1);
     updateJob(job.id, {
       editRender: {
         ...(cur?.editRender || {}),
         status: 'done',
         finishedAt: new Date().toISOString(),
         error: null,
-        progress: { phase: 'done', done: 1, total: 1 },
+        progress: {
+          phase: 'done',
+          done: totalClips,
+          total: totalClips,
+          percent: 100,
+        },
       },
     });
     logForJob(job.id, 'edit render done');

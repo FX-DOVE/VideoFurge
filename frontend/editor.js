@@ -327,23 +327,42 @@ function _paintEditor() {
   const selMeta = selected ? _sourceMeta(selected.sourceIndex) : null;
   const er = _editor.editRender || {};
 
+  const done = er.progress?.done ?? 0;
+  const renderTotal = er.progress?.total ?? 0;
+  const pct = (typeof _editRenderPercent === 'function')
+    ? _editRenderPercent(er)
+    : (renderTotal ? Math.min(100, Math.round((done / renderTotal) * 100)) : (er.status === 'rendering' ? 45 : 10));
+
   app.innerHTML = `
   <div class="ce-root">
     <!-- Top bar -->
-    <header class="ce-topbar">
+    <header class="ce-topbar" style="position: relative;">
       <a href="#/jobs/${escAttr(_editor.jobId)}" class="ce-back" title="Back to job">←</a>
       <div class="ce-title-block">
         <div class="ce-title">${escHtml(_editor.title)}</div>
         <div class="ce-sub">${enabled.length} clips · ${_fmtEditorDur(total)} · assembled — edit then Render</div>
       </div>
-      <div class="ce-top-actions">
+      <div class="ce-top-actions" style="display: flex; align-items: center; gap: 0.5rem;">
+        ${busy ? `
+          <div class="ce-render-status" style="font-size: 0.8rem; color: #a5b4fc; display: flex; align-items: center; gap: 0.35rem; font-weight: 500; margin-right: 0.5rem;">
+            <span class="ce-render-spinner" style="width: 12px; height: 12px; border: 1.8px solid #a5b4fc; border-top-color: transparent; border-radius: 50%; display: inline-block; animation: ce-spin 0.8s linear infinite;"></span>
+            <span id="ce-top-render-pct">Rendering (${pct}%)</span>
+          </div>
+        ` : ''}
         <button type="button" class="ce-icon-btn" id="ce-undo" title="Undo (Ctrl+Z)" ${busy || _editor.historyPos <= 0 ? 'disabled' : ''}>↩</button>
         <button type="button" class="ce-icon-btn" id="ce-redo" title="Redo (Ctrl+Y)" ${busy || _editor.historyPos >= _editor.history.length - 1 ? 'disabled' : ''}>↪</button>
         <button type="button" class="btn btn-ghost btn-sm" id="ce-save" ${busy ? 'disabled' : ''}>💾 Save</button>
-        <button type="button" class="btn btn-primary btn-sm" id="ce-render" ${busy ? 'disabled' : ''}>
-          ${busy ? 'Rendering…' : '▶ Render'}
-        </button>
+        ${er.status === 'done' ? `
+          <a class="btn btn-sm" href="${escAttr(mediaUrl(`/api/jobs/${_editor.jobId}/download/edited`))}" download style="background: #10b981; border-color: #10b981; color: white;">
+            ⬇ Download MP4
+          </a>
+        ` : `
+          <button type="button" class="btn btn-primary btn-sm" id="ce-render" ${busy ? 'disabled' : ''}>
+            ${busy ? 'Rendering…' : '▶ Render'}
+          </button>
+        `}
       </div>
+      ${busy ? `<div class="ce-topbar-progress-line" style="position: absolute; bottom: 0; left: 0; height: 3px; background: linear-gradient(90deg, #6366f1, #8b5cf6); width: ${pct}%; transition: width 0.4s ease;"></div>` : ''}
     </header>
 
     <div class="ce-body ${_editor.sideOpen ? 'side-open' : ''}">
@@ -649,9 +668,9 @@ function _ceSidePanelHtml(selected, selMeta, busy) {
       <div class="ce-fields">
         <label>Audio mode
           <select id="ed-audio-mode" ${busy ? 'disabled' : ''}>
-            <option value="acted" ${_editor.timeline.audioMode === 'acted' ? 'selected' : ''}>Acted (BGM + SFX)</option>
-            <option value="voice" ${_editor.timeline.audioMode === 'voice' ? 'selected' : ''}>Voice + mix</option>
-            <option value="silent" ${_editor.timeline.audioMode === 'silent' ? 'selected' : ''}>Silent / clip audio only</option>
+            <option value="acted" ${_editor.timeline.audioMode === 'acted' ? 'selected' : ''}>Acted — lip-synced clip talking + BGM + SFX (like Acted video)</option>
+            <option value="voice" ${_editor.timeline.audioMode === 'voice' ? 'selected' : ''}>Voice — narration + mix (no clip talking)</option>
+            <option value="silent" ${_editor.timeline.audioMode === 'silent' ? 'selected' : ''}>Clip talking only (no BGM / SFX / voiceover)</option>
           </select>
         </label>
 
@@ -881,12 +900,27 @@ function _ceCaptionsTrackHtml() {
 }
 
 
+function _ceRenderPercent(er) {
+  if (typeof _editRenderPercent === 'function') return _editRenderPercent(er);
+  if (!er) return 0;
+  if (er.status === 'done') return 100;
+  const p = er.progress || {};
+  if (typeof p.percent === 'number') return Math.max(0, Math.min(100, Math.round(p.percent)));
+  if (p.total) return Math.min(100, Math.round(100 * (p.done || 0) / p.total));
+  return er.status === 'rendering' ? 45 : 10;
+}
+
+function _cePhaseLabel(phase) {
+  if (typeof _editRenderPhaseLabel === 'function') return _editRenderPhaseLabel(phase);
+  return phase || 'Working';
+}
+
 function _ceRenderBannerHtml(er) {
   if (!er || !er.status || er.status === 'idle') {
     if (_editor?.assets?.edited) {
-      return `<div class="edit-render-banner edit-render-done">
+      return `<div class="edit-render-banner edit-render-done" id="ce-render-banner">
         Last edit ready &mdash;
-        <a href="${escAttr(mediaUrl(`/api/jobs/${_editor.jobId}/download/edited`))}" download>Download</a>
+        <a class="btn btn-sm btn-primary" href="${escAttr(mediaUrl(`/api/jobs/${_editor.jobId}/download/edited`))}" download>⬇ Download MP4</a>
       </div>`;
     }
     return '';
@@ -895,20 +929,30 @@ function _ceRenderBannerHtml(er) {
     const phase = er.progress?.phase || er.status;
     const done = er.progress?.done ?? 0;
     const total = er.progress?.total ?? 0;
-    return `<div class="edit-render-banner edit-render-busy">
-      <strong>Rendering on server</strong>
-      <span>(${escHtml(String(phase))}${total ? ` &middot; ${done}/${total}` : ''}). Safe to leave &mdash; return anytime.</span>
+    const pct = _ceRenderPercent(er);
+    return `<div class="edit-render-banner edit-render-busy edit-render-banner-progress" id="ce-render-banner">
+      <div class="edit-render-progress-head">
+        <strong>Rendering on server</strong>
+        <span class="edit-render-pct">${pct}%</span>
+      </div>
+      <div class="edit-render-progress-track" role="progressbar" aria-valuenow="${pct}" aria-valuemin="0" aria-valuemax="100">
+        <div class="edit-render-progress-fill" id="ce-banner-bar" style="width:${pct}%"></div>
+      </div>
+      <div class="edit-render-progress-meta">
+        <span id="ce-banner-phase">${escHtml(_cePhaseLabel(phase))}${total ? ` · ${done}/${total} clips` : ''}</span>
+        <span>Safe to leave — download when finished</span>
+      </div>
     </div>`;
   }
   if (er.status === 'failed') {
-    return `<div class="edit-render-banner edit-render-failed">
+    return `<div class="edit-render-banner edit-render-failed" id="ce-render-banner">
       <strong>Render failed:</strong> ${escHtml(er.error || 'Unknown error')}
     </div>`;
   }
   if (er.status === 'done') {
-    return `<div class="edit-render-banner edit-render-done">
+    return `<div class="edit-render-banner edit-render-done" id="ce-render-banner">
       <strong>Render complete!</strong>
-      <a class="btn btn-sm btn-primary" href="${escAttr(mediaUrl(`/api/jobs/${_editor.jobId}/download/edited`))}" download>&#8595; Download</a>
+      <a class="btn btn-sm btn-primary" href="${escAttr(mediaUrl(`/api/jobs/${_editor.jobId}/download/edited`))}" download>⬇ Download MP4</a>
     </div>`;
   }
   return '';
@@ -916,16 +960,18 @@ function _ceRenderBannerHtml(er) {
 
 function _ceRenderOverlayHtml(er) {
   if (er.status === 'queued' || er.status === 'rendering') {
-    const pct = er.progress?.total
-      ? Math.round(100 * (er.progress.done || 0) / er.progress.total)
-      : (er.status === 'rendering' ? 45 : 10);
+    const pct = _ceRenderPercent(er);
+    const phase = er.progress?.phase || er.status;
+    const done = er.progress?.done ?? 0;
+    const total = er.progress?.total ?? 0;
     return `
       <div class="ce-overlay" id="ce-overlay-modal">
         <div class="ce-modal">
           <div class="ce-spinner"></div>
           <h3>Rendering your video&hellip;</h3>
-          <p>${escHtml(er.progress?.phase || er.status)} &mdash; keep going offline if you want</p>
-          <div class="ce-progress"><div style="width:${pct}%"></div></div>
+          <p id="ce-overlay-phase">${escHtml(_cePhaseLabel(phase))}${total ? ` · ${done}/${total} clips` : ''}</p>
+          <div class="ce-progress"><div id="ce-overlay-bar" style="width:${pct}%"></div></div>
+          <p class="ce-overlay-pct" id="ce-overlay-pct">${pct}%</p>
           <p class="ce-hint">You can close this tab. The worker keeps rendering; download when you return.</p>
           <button type="button" class="btn btn-ghost" id="ce-dismiss-overlay">Work in background</button>
         </div>
@@ -937,9 +983,10 @@ function _ceRenderOverlayHtml(er) {
         <div class="ce-modal">
           <div class="ce-success-icon">&#10003;</div>
           <h3>Render complete!</h3>
-          <video controls class="ce-modal-video" src="${escAttr(mediaUrl(`/api/jobs/${_editor.jobId}/preview/edited`))}"></video>
+          <p>Your edited video is ready to download.</p>
+          <video controls class="ce-modal-video" src="${escAttr(mediaUrl(`/api/jobs/${_editor.jobId}/preview/edited`))}&_t=${Date.now()}"></video>
           <div class="ce-modal-actions">
-            <a class="btn btn-primary" href="${escAttr(mediaUrl(`/api/jobs/${_editor.jobId}/download/edited`))}" download>Download MP4</a>
+            <a class="btn btn-primary" href="${escAttr(mediaUrl(`/api/jobs/${_editor.jobId}/download/edited`))}" download>⬇ Download MP4</a>
             <button type="button" class="btn btn-ghost" id="ce-dismiss-overlay">Close</button>
           </div>
         </div>
@@ -1029,23 +1076,29 @@ function _wireEditorEvents(busy) {
 
   document.getElementById('ed-reset-order')?.addEventListener('click', () => {
     if (busy) return;
-    showConfirm('Reset timeline', 'Restore original clip order and full lengths?', () => {
-      _editor.timeline.clips = _editor.sourceClips.map((c, i) => ({
-        id: `c${i}-${c.index}`,
-        sourceIndex: c.index,
-        enabled: true,
-        trimStart: 0,
-        trimEnd: Number((c.duration || 0).toFixed(3)),
-        speed: 1,
-        transition: i === 0 ? 'none' : (_editor.timeline.defaultTransition || 'fade'),
-        transitionDuration: 0.35,
-      }));
-      _editor.selectedId = _editor.timeline.clips[0]?.id || null;
-      _editor.playhead = 0;
-      _editorPushHistory();
-      _paintEditor();
-      showToast('Timeline reset.', 'success');
-    });
+    showConfirm(
+      'Reset timeline',
+      'Restore original clip order and full lengths?',
+      () => {
+        _editor.timeline.clips = _editor.sourceClips.map((c, i) => ({
+          id: `c${i}-${c.index}`,
+          sourceIndex: c.index,
+          enabled: true,
+          trimStart: 0,
+          trimEnd: Number((c.duration || 0).toFixed(3)),
+          speed: 1,
+          transition: i === 0 ? 'none' : (_editor.timeline.defaultTransition || 'fade'),
+          transitionDuration: 0.35,
+        }));
+        _editor.selectedId = _editor.timeline.clips[0]?.id || null;
+        _editor.playhead = 0;
+        _editorPushHistory();
+        _paintEditor();
+        showToast('Timeline reset.', 'success');
+      },
+      'Reset',
+      true
+    );
   });
 
   // Story list
@@ -1590,7 +1643,7 @@ function _editorDeleteSelected(hard) {
     showToast(hard ? 'Clip deleted.' : 'Clip removed.', 'success');
   };
   if (hard) {
-    showConfirm('Delete clip', 'Permanently remove this clip from the timeline? You can Undo (Ctrl+Z).', doDelete);
+    showConfirm('Delete clip', 'Permanently remove this clip from the timeline? You can Undo (Ctrl+Z).', doDelete, 'Delete', true);
   } else {
     doDelete();
   }
@@ -2019,24 +2072,65 @@ async function _editorRender() {
       } catch (e) {
         showToast(e.message, 'error');
       }
-    }
+    },
+    'Render'
   );
 }
 
 function _applyEditorJobUpdate(job) {
   if (!_editor || !_editor.jobId || job.id !== _editor.jobId) return;
-  if (job.editRender) {
-    const prev = _editor.editRender?.status;
-    _editor.editRender = job.editRender;
-    if (job.assets) _editor.assets = { ..._editor.assets, ...job.assets };
-    if (prev !== job.editRender.status || ['queued', 'rendering'].includes(job.editRender.status)) {
-      _paintEditor();
+  if (!job.editRender) return;
+
+  const prev = _editor.editRender?.status;
+  const prevPct = _ceRenderPercent(_editor.editRender || {});
+  _editor.editRender = job.editRender;
+  if (job.assets) _editor.assets = { ..._editor.assets, ...job.assets };
+
+  const status = job.editRender.status;
+  const statusChanged = prev !== status;
+
+  // Full paint on status transitions (queued→rendering→done/failed) so overlay/buttons swap
+  if (statusChanged) {
+    _paintEditor();
+    if (prev !== 'done' && status === 'done') {
+      showToast('Edited video is ready — download it now!', 'success', 8000);
     }
-    if (prev !== 'done' && job.editRender.status === 'done') {
-      showToast('Edited video is ready to download!', 'success', 7000);
-    }
-    if (prev !== 'failed' && job.editRender.status === 'failed') {
+    if (prev !== 'failed' && status === 'failed') {
       showToast(`Edit render failed: ${job.editRender.error || 'error'}`, 'error', 7000);
+    }
+    return;
+  }
+
+  // Same status (queued/rendering): update progress bars in-place without rebuilding the editor
+  if (status === 'queued' || status === 'rendering') {
+    const pct = _ceRenderPercent(job.editRender);
+    const phase = job.editRender.progress?.phase || status;
+    const done = job.editRender.progress?.done ?? 0;
+    const total = job.editRender.progress?.total ?? 0;
+    const phaseText = `${_cePhaseLabel(phase)}${total ? ` · ${done}/${total} clips` : ''}`;
+
+    const overlayBar = document.getElementById('ce-overlay-bar');
+    const overlayPct = document.getElementById('ce-overlay-pct');
+    const overlayPhase = document.getElementById('ce-overlay-phase');
+    if (overlayBar) overlayBar.style.width = `${pct}%`;
+    if (overlayPct) overlayPct.textContent = `${pct}%`;
+    if (overlayPhase) overlayPhase.textContent = phaseText;
+
+    const bannerBar = document.getElementById('ce-banner-bar');
+    const bannerPhase = document.getElementById('ce-banner-phase');
+    if (bannerBar) bannerBar.style.width = `${pct}%`;
+    if (bannerPhase) bannerPhase.textContent = phaseText;
+    const bannerPct = document.querySelector('#ce-render-banner .edit-render-pct');
+    if (bannerPct) bannerPct.textContent = `${pct}%`;
+
+    const topLine = document.querySelector('.ce-topbar-progress-line');
+    if (topLine) topLine.style.width = `${pct}%`;
+    const topPct = document.getElementById('ce-top-render-pct');
+    if (topPct) topPct.textContent = `Rendering (${pct}%)`;
+
+    // If overlay was dismissed, keep banner progress visible; if neither exists, repaint once
+    if (!overlayBar && !bannerBar && pct !== prevPct) {
+      _paintEditor();
     }
   }
 }

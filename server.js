@@ -194,7 +194,7 @@ function stripSafe(job) {
 // Compact summary for the list view.
 function jobSummary(job) {
   if (!job) return null;
-  return {
+  const summary = {
     id:        job.id,
     title:     job.title,
     status:    job.status,
@@ -203,7 +203,20 @@ function jobSummary(job) {
     progress:  job.progress,
     error:     job.error      || null,
     recovery:  job.recovery   || null,
+    assets:    getJobAssets(job),
   };
+  // Surface edit-render progress so the jobs list can show a live progress bar
+  if (job.editRender && job.editRender.status) {
+    summary.editRender = {
+      status: job.editRender.status || null,
+      error: job.editRender.error || null,
+      progress: job.editRender.progress || null,
+      queuedAt: job.editRender.queuedAt || null,
+      startedAt: job.editRender.startedAt || null,
+      finishedAt: job.editRender.finishedAt || null,
+    };
+  }
+  return summary;
 }
 
 // ---- Routes ----
@@ -678,7 +691,7 @@ app.post('/api/jobs/:id/editor/render', (req, res, next) => {
       startedAt: null,
       finishedAt: null,
       error: null,
-      progress: { phase: 'queued', done: 0, total: enabledCount },
+      progress: { phase: 'queued', done: 0, total: enabledCount, percent: 0 },
       claimedBy: null,
     };
 
@@ -714,6 +727,46 @@ app.get('/api/jobs/:id/download/:asset', async (req, res, next) => {
       edited: path.join(jobDir(job.id), 'output', 'edited.mp4'),
       images: path.join(jobDir(job.id), 'output', 'images.zip'),
     };
+    if (req.params.asset === 'transcript') {
+      const formatMs = (ms) => {
+        if (ms == null) return '00:00.0';
+        const totalSecs = ms / 1000;
+        const mins = Math.floor(totalSecs / 60);
+        const secs = Math.floor(totalSecs % 60);
+        const tenths = Math.floor((ms % 1000) / 100);
+        return `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}.${tenths}`;
+      };
+
+      const segments = Array.isArray(job.segments) ? job.segments : [];
+      if (segments.length === 0) {
+        try {
+          const jsonPath = path.join(jobDir(job.id), 'output', 'transcript.json');
+          if (fs.existsSync(jsonPath)) {
+            const raw = JSON.parse(fs.readFileSync(jsonPath, 'utf8'));
+            const transcription = raw.transcription || [];
+            segments.push(...transcription.map(t => ({
+              startMs: t.offsets?.from || 0,
+              endMs: t.offsets?.to || 0,
+              text: t.text || ''
+            })));
+          }
+        } catch (_) {}
+      }
+
+      if (segments.length === 0) {
+        return res.status(404).json({ error: 'transcript not found or not yet generated' });
+      }
+
+      const lines = segments.map(seg => {
+        return `[${formatMs(seg.startMs)}] ${seg.text}`;
+      });
+      const transcriptText = lines.join('\n');
+
+      res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+      res.setHeader('Content-Disposition', `attachment; filename="transcript_${job.id}.txt"`);
+      return res.send(transcriptText);
+    }
+
     let file = targets[req.params.asset];
     if (!file) return res.status(404).json({ error: 'asset not found' });
 
