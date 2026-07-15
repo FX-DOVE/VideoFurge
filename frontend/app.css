@@ -1559,23 +1559,218 @@ body.editor-open #app.container-wide { max-width: none; }
   flex-shrink: 0;
   border-top: 1px solid var(--clr-border);
   background: #0c0c1c;
-  padding-bottom: 8px;
+  padding-bottom: 0px;
 }
+
+/* ── Multi-Track Timeline Layout ── */
+.ce-timeline-multi {
+  display: grid;
+  grid-template-columns: 100px 1fr;
+  background: #090918;
+  border-top: 1px solid rgba(255,255,255,0.06);
+}
+.ce-timeline-headers {
+  display: flex;
+  flex-direction: column;
+  background: #070715;
+  border-right: 1px solid rgba(255,255,255,0.05);
+  user-select: none;
+}
+.ce-tl-header-spacer {
+  height: 24px; /* Matches ruler height + margins */
+}
+.ce-tl-track-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 10px;
+  color: var(--clr-text-2);
+  font-size: 11px;
+  font-weight: 600;
+  border-bottom: 1px solid rgba(255,255,255,0.02);
+}
+.ce-header-video { height: 64px; }
+.ce-header-bgm { height: 40px; }
+.ce-header-voice { height: 40px; }
+.ce-header-captions { height: 32px; }
+
+.ce-hdr-icon { font-size: 13px; }
+.ce-hdr-label {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Track rows */
+.ce-track-row {
+  position: relative;
+  border-bottom: 1px solid rgba(255,255,255,0.02);
+  display: flex;
+  align-items: center;
+}
+.ce-row-video { height: 64px; }
+.ce-row-bgm { height: 40px; }
+.ce-row-voice { height: 40px; }
+.ce-row-captions { height: 32px; }
+
+/* Audio track bars */
+.ce-audio-track-bar {
+  position: absolute;
+  height: 28px;
+  border-radius: 6px;
+  padding: 0 10px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 10px;
+  font-weight: 700;
+  color: #fff;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.15), 0 2px 4px rgba(0,0,0,0.2);
+}
+.ce-bgm-bar {
+  background: linear-gradient(130deg, #059669 0%, #10b981 100%);
+  border: 1px solid rgba(16,185,129,0.3);
+}
+.ce-voice-bar {
+  background: linear-gradient(130deg, #7c3aed 0%, #a855f7 100%);
+  border: 1px solid rgba(168,85,247,0.3);
+}
+.ce-audio-track-name {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 250px;
+}
+.ce-audio-track-vol {
+  opacity: 0.65;
+  font-weight: 400;
+}
+
+/* Captions track bar */
+.ce-caption-track-bar {
+  position: absolute;
+  height: 20px;
+  background: rgba(245,158,11,0.12);
+  border: 1px solid rgba(245,158,11,0.35);
+  border-radius: 4px;
+  color: #f59e0b;
+  font-size: 9px;
+  font-weight: 600;
+  padding: 0 6px;
+  display: flex;
+  align-items: center;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  pointer-events: none;
+}
+
+/* Side header search row */
+.ce-story-header-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  width: 100%;
+}
+.ce-story-header-row .ce-search {
+  flex: 1;
+}
+.ce-import-btn {
+  height: 38px;
+  padding: 0 12px;
+  border-radius: 8px;
+  font-weight: 600;
+  font-size: 12px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  white-space: nowrap;
+}
+.ce-loading-inline {
+  padding: 40px 20px;
+  text-align: center;
+  color: var(--clr-text-3);
+}
+.ce-loading-inline .ce-spinner {
+  width: 24px;
+  height: 24px;
+  margin: 0 auto 8px;
+}
+
+/* ── Transport controls (CapCut style) ── */
+.ce-transport {
+  display: flex; align-items: center; gap: 2px;
+  background: rgba(255,255,255,0.05);
+  border: 1px solid var(--clr-border);
+  border-radius: 10px;
+  padding: 3px;
+}
+.ce-transport-btn {
+  display: flex; align-items: center; justify-content: center;
+  width: 32px; height: 32px;
+  border-radius: 7px;
+  background: none;
+  border: none;
+  color: var(--clr-text-2);
+  cursor: pointer;
+  transition: background var(--t-fast), color var(--t-fast), transform 80ms;
+}
+.ce-transport-btn:hover { background: rgba(255,255,255,0.08); color: var(--clr-text); }
+.ce-transport-btn:active { transform: scale(0.92); }
+.ce-transport-play {
+  width: 38px; height: 38px;
+  background: var(--grad-primary);
+  color: #fff !important;
+  border-radius: 9px;
+  box-shadow: 0 2px 10px rgba(99,102,241,0.45);
+}
+.ce-transport-play:hover { filter: brightness(1.12); background: var(--grad-primary-h); }
+.ce-transport-play.is-playing {
+  background: linear-gradient(135deg, #f43f5e, #ec4899);
+  box-shadow: 0 2px 10px rgba(244,63,94,0.45);
+}
+
 .ce-tl-toolbar {
   display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
   padding: 8px 12px;
   border-bottom: 1px solid rgba(255,255,255,0.05);
 }
-.ce-time-readout {
-  font-size: 12px; font-variant-numeric: tabular-nums;
-  color: var(--clr-text-2); display: flex; gap: 4px;
+.ce-tl-divider {
+  width: 1px; height: 28px; background: var(--clr-border); flex-shrink: 0;
 }
+.ce-time-readout {
+  display: flex; align-items: baseline; gap: 3px;
+  font-size: 13px; font-variant-numeric: tabular-nums; font-weight: 600;
+  letter-spacing: -0.01em;
+}
+.ce-time-cur { color: #e2e8ff; }
+.ce-time-sep { color: var(--clr-text-3); font-size: 11px; }
+.ce-time-total { color: var(--clr-text-3); font-size: 11px; font-weight: 400; }
+
 .ce-tl-edit-tools {
   display: flex; align-items: center; gap: 4px; flex-wrap: wrap;
-  padding-left: 8px;
-  border-left: 1px solid var(--clr-border);
 }
 .ce-tl-edit-tools .btn { white-space: nowrap; }
+
+/* CapCut-style scissors/cut button */
+.ce-cut-btn {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 5px 10px; border-radius: 7px;
+  background: rgba(168,85,247,0.15);
+  border: 1px solid rgba(168,85,247,0.35);
+  color: #d8b4fe;
+  font-size: 12px; font-weight: 600;
+  cursor: pointer;
+  transition: background var(--t-fast), border-color var(--t-fast), transform 80ms;
+  white-space: nowrap;
+}
+.ce-cut-btn:hover:not(:disabled) {
+  background: rgba(168,85,247,0.28);
+  border-color: rgba(168,85,247,0.6);
+  transform: translateY(-1px);
+}
+.ce-cut-btn:disabled { opacity: 0.35; cursor: not-allowed; }
+
 .ce-zoom {
   display: flex; align-items: center; gap: 4px;
   margin-left: auto;
@@ -1661,7 +1856,7 @@ body.ce-trimming * { cursor: ew-resize !important; }
   transform: translateX(-50%);
 }
 .ce-track-row {
-  position: relative; height: 64px;
+  position: relative;
 }
 .ce-playhead {
   position: absolute; top: -22px; bottom: 0;
@@ -1828,6 +2023,128 @@ body.ce-trimming * { cursor: ew-resize !important; }
 .ce-success-icon { background: rgba(16,185,129,0.15); color: #34d399; }
 .ce-fail-icon { background: rgba(239,68,68,0.15); color: #f87171; }
 
+/* ── Audio track cards (Audio side tab) ── */
+.ce-audio-card {
+  background: rgba(255,255,255,0.03);
+  border: 1px solid var(--clr-border);
+  border-radius: 12px;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  transition: border-color var(--t-fast);
+}
+.ce-audio-card:hover { border-color: rgba(99,102,241,0.3); }
+
+.ce-audio-card-header {
+  display: flex; align-items: center; gap: 10px;
+}
+.ce-audio-card-icon {
+  width: 36px; height: 36px; border-radius: 9px; flex-shrink: 0;
+  display: flex; align-items: center; justify-content: center;
+}
+.ce-audio-icon-music { background: rgba(99,102,241,0.18); color: #a5b4fc; }
+.ce-audio-icon-voice { background: rgba(16,185,129,0.15); color: #6ee7b7; }
+.ce-audio-card-info { flex: 1; min-width: 0; }
+.ce-audio-card-title {
+  font-size: 12px; font-weight: 700; color: var(--clr-text);
+}
+.ce-audio-card-sub {
+  font-size: 10px; color: var(--clr-text-3);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 130px;
+}
+
+/* Toggle pill (iOS-style) */
+.ce-audio-toggle {
+  position: relative; width: 36px; height: 20px; flex-shrink: 0; cursor: pointer;
+}
+.ce-audio-toggle input { opacity: 0; width: 0; height: 0; position: absolute; }
+.ce-toggle-pill {
+  position: absolute; inset: 0;
+  background: rgba(255,255,255,0.12);
+  border-radius: 999px;
+  transition: background 200ms;
+  border: 1px solid rgba(255,255,255,0.15);
+}
+.ce-toggle-pill::after {
+  content: '';
+  position: absolute; top: 2px; left: 2px;
+  width: 14px; height: 14px; border-radius: 50%;
+  background: rgba(255,255,255,0.6);
+  transition: transform 200ms, background 200ms;
+}
+.ce-audio-toggle input:checked + .ce-toggle-pill {
+  background: var(--clr-primary);
+  border-color: var(--clr-primary);
+}
+.ce-audio-toggle input:checked + .ce-toggle-pill::after {
+  transform: translateX(16px);
+  background: #fff;
+}
+
+/* Drop zone */
+.ce-audio-drop-zone {
+  border: 1.5px dashed var(--clr-border);
+  border-radius: 10px;
+  padding: 14px 8px;
+  text-align: center;
+  cursor: pointer;
+  position: relative;
+  transition: border-color var(--t-fast), background var(--t-fast);
+  overflow: hidden;
+}
+.ce-audio-drop-zone:hover,
+.ce-audio-drop-zone.drag-over {
+  border-color: var(--clr-primary);
+  background: rgba(99,102,241,0.08);
+}
+.ce-audio-drop-zone.has-file {
+  border-style: solid;
+  border-color: rgba(99,102,241,0.4);
+  background: rgba(99,102,241,0.06);
+  padding: 10px 8px;
+}
+.ce-audio-file-input {
+  position: absolute; inset: 0; opacity: 0; width: 100%; height: 100%;
+  cursor: pointer; z-index: 1;
+}
+.ce-audio-drop-content { pointer-events: none; }
+.ce-audio-drop-icon { font-size: 22px; margin-bottom: 4px; }
+.ce-audio-drop-text { font-size: 11px; color: var(--clr-text-2); font-weight: 600; }
+.ce-audio-drop-sub { font-size: 10px; color: var(--clr-text-3); margin-top: 2px; }
+.ce-audio-file-name {
+  font-size: 11px; font-weight: 600; color: #c4b5fd;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+
+/* Volume row */
+.ce-audio-vol-row {
+  display: flex; align-items: center; gap: 8px;
+}
+.ce-audio-vol-label {
+  font-size: 10px; color: var(--clr-text-3); flex-shrink: 0; white-space: nowrap;
+  display: flex; align-items: center; gap: 3px;
+}
+.ce-audio-vol-row input[type="range"] {
+  flex: 1; accent-color: var(--clr-primary); height: 4px;
+}
+.ce-audio-vol-val {
+  font-size: 10px; font-weight: 600; color: var(--clr-text-2);
+  min-width: 30px; text-align: right; font-variant-numeric: tabular-nums;
+}
+.ce-audio-remove-btn {
+  background: rgba(239,68,68,0.1);
+  border: 1px solid rgba(239,68,68,0.25);
+  color: #f87171;
+  padding: 5px 10px; border-radius: 7px;
+  font-size: 11px; font-weight: 600; cursor: pointer;
+  transition: background var(--t-fast);
+  width: 100%;
+}
+.ce-audio-remove-btn:hover:not(:disabled) { background: rgba(239,68,68,0.2); }
+.ce-audio-remove-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+
 @media (max-width: 900px) {
   .ce-body { grid-template-columns: 48px 1fr; }
   .ce-side { display: none; }
@@ -1839,6 +2156,7 @@ body.ce-trimming * { cursor: ew-resize !important; }
   }
   .ce-nav-btn { display: none; }
 }
+
 
 /* =============================================================
    RESPONSIVE

@@ -81,6 +81,75 @@ function _editorEnabledClips() {
   return (_editor?.timeline.clips || []).filter(c => c.enabled !== false);
 }
 
+function _getAudioElement(key) {
+  if (!_editor) return null;
+  const track = _editor.timeline[key];
+  if (!track || !track.enabled || !track.filename) {
+    if (_editor[key + 'Element']) {
+      try { _editor[key + 'Element'].pause(); } catch (_) {}
+      _editor[key + 'Element'] = null;
+    }
+    return null;
+  }
+  
+  if (!_editor[key + 'Element']) {
+    const aud = new Audio();
+    aud.preload = 'auto';
+    _editor[key + 'Element'] = aud;
+  }
+  
+  const aud = _editor[key + 'Element'];
+  const url = track.url.startsWith('blob:') ? track.url : mediaUrl(track.url);
+  
+  // Resolve cross-origin / local url correctly
+  let absoluteUrl = url;
+  if (url.startsWith('/')) {
+    // Make sure we have the full origin so browser treats it as a fresh stream
+    absoluteUrl = window.location.origin + url;
+  }
+
+  if (aud.src !== absoluteUrl) {
+    aud.src = absoluteUrl;
+    aud.load();
+  }
+  aud.volume = Number(track.volume ?? 1.0);
+  return aud;
+}
+
+function _safePlayAudio(aud, time) {
+  if (!aud) return;
+  const playAudio = () => {
+    try {
+      aud.play().catch((e) => console.warn('Audio play blocked:', e));
+    } catch (_) {}
+  };
+  if (aud.readyState >= 1) {
+    try { aud.currentTime = time; } catch (_) {}
+    playAudio();
+  } else {
+    const onMeta = () => {
+      aud.removeEventListener('loadedmetadata', onMeta);
+      try { aud.currentTime = time; } catch (_) {}
+      playAudio();
+    };
+    aud.addEventListener('loadedmetadata', onMeta);
+  }
+}
+
+function _safeSeekAudio(aud, time) {
+  if (!aud) return;
+  if (aud.readyState >= 1) {
+    try { aud.currentTime = time; } catch (_) {}
+  } else {
+    const onMeta = () => {
+      aud.removeEventListener('loadedmetadata', onMeta);
+      try { aud.currentTime = time; } catch (_) {}
+    };
+    aud.addEventListener('loadedmetadata', onMeta);
+  }
+}
+
+
 function _editorPushHistory() {
   if (!_editor) return;
   const snap = JSON.stringify(_editor.timeline);
@@ -169,6 +238,9 @@ function _initEditorState(jobId, data) {
   }
   if (!timeline.defaultTransition) timeline.defaultTransition = 'fade';
   if (!timeline.resolution) timeline.resolution = '1920x1080';
+  // Audio tracks
+  if (!timeline.bgMusic)    timeline.bgMusic    = { enabled: false, filename: '', volume: 0.4, url: '' };
+  if (!timeline.voiceTrack) timeline.voiceTrack = { enabled: false, filename: '', volume: 1.0, url: '' };
   timeline.clips.forEach((c, i) => { if (!c.id) c.id = `c${i}-${c.sourceIndex}`; });
 
   _editor = {
@@ -294,21 +366,21 @@ function _paintEditor() {
       <!-- Main stage -->
       <section class="ce-main">
         <div class="ce-preview-wrap">
-          <button type="button" class="ce-nav-btn ce-nav-prev" id="ce-prev" title="Previous clip">‹</button>
+          <button type="button" class="ce-nav-btn ce-nav-prev" id="ce-prev" title="Previous clip">&#8249;</button>
           <div class="ce-preview-stage">
             <video id="ed-video" class="ce-video" playsinline preload="metadata"></video>
             <div class="ce-preview-overlay" id="ed-overlay">
-              <span>Select a clip · Space to play</span>
+              <span>Select a clip &middot; Space to play</span>
             </div>
             <div class="ce-preview-caption" id="ce-live-caption"></div>
           </div>
-          <button type="button" class="ce-nav-btn ce-nav-next" id="ce-next" title="Next clip">›</button>
+          <button type="button" class="ce-nav-btn ce-nav-next" id="ce-next" title="Next clip">&#8250;</button>
         </div>
 
         <div class="ce-info-bar">
-          <span class="ce-pill">Clip ${selected ? (enabled.findIndex(c => c.id === selected.id) + 1) : '—'} / ${enabled.length}</span>
+          <span class="ce-pill">Clip ${selected ? (enabled.findIndex(c => c.id === selected.id) + 1) : '&#8212;'} / ${enabled.length}</span>
           <span class="ce-info-text" title="${escAttr(selMeta?.text || '')}">${escHtml((selMeta?.text || 'No clip selected').slice(0, 90))}</span>
-          <span class="ce-info-meta">${selected ? _fmtEditorTime(_clipDuration(selected)) : '—'} · Total ${_fmtEditorDur(total)}</span>
+          <span class="ce-info-meta">${selected ? _fmtEditorTime(_clipDuration(selected)) : '&#8212;'} &middot; Total ${_fmtEditorDur(total)}</span>
         </div>
 
         ${_ceRenderBannerHtml(er)}
@@ -316,34 +388,96 @@ function _paintEditor() {
         <!-- Timeline -->
         <div class="ce-timeline">
           <div class="ce-tl-toolbar">
-            <button type="button" class="btn btn-sm ${ _editor.playing ? 'btn-danger' : 'btn-primary'}" id="ed-play">
-              ${_editor.playing ? '⏸ Pause' : '▶ Play all'}
-            </button>
-            <button type="button" class="btn btn-sm btn-ghost" id="ed-stop">⏹</button>
+            <!-- CapCut-style transport controls -->
+            <div class="ce-transport">
+              <button type="button" class="ce-transport-btn ce-transport-restart" id="ed-restart" title="Restart &amp; Play from beginning">
+                <svg viewBox="0 0 24 24" fill="currentColor" width="16" height="16"><path d="M6 6h2v12H6zm3.5 6 8.5 6V6z"/></svg>
+              </button>
+              <button type="button" class="ce-transport-btn ce-transport-play ${_editor.playing ? 'is-playing' : ''}" id="ed-play"
+                title="${_editor.playing ? 'Pause (Space)' : 'Play from here (Space)'}">
+                ${_editor.playing
+                  ? '<svg viewBox="0 0 24 24" fill="currentColor" width="18" height="18"><path d="M6 19h4V5H6zm8-14v14h4V5z"/></svg>'
+                  : '<svg viewBox="0 0 24 24" fill="currentColor" width="18" height="18"><path d="M8 5v14l11-7z"/></svg>'
+                }
+              </button>
+              <button type="button" class="ce-transport-btn ce-transport-stop" id="ed-stop" title="Stop">
+                <svg viewBox="0 0 24 24" fill="currentColor" width="16" height="16"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
+              </button>
+            </div>
+
             <div class="ce-time-readout">
-              <span id="ed-time-cur">${_fmtEditorTime(_editor.playhead)}</span>
-              <span>/</span>
-              <span id="ed-time-total">${_fmtEditorTime(total)}</span>
+              <span id="ed-time-cur" class="ce-time-cur">${_fmtEditorTime(_editor.playhead)}</span>
+              <span class="ce-time-sep">/</span>
+              <span id="ed-time-total" class="ce-time-total">${_fmtEditorTime(total)}</span>
             </div>
+
+            <div class="ce-tl-divider"></div>
+
             <div class="ce-tl-edit-tools" title="Edit selected clip">
-              <button type="button" class="btn btn-sm btn-ghost" id="tl-trim-front" ${busy || !selected ? 'disabled' : ''} title="Trim 0.5s from the front">⟸ Front</button>
-              <button type="button" class="btn btn-sm btn-ghost" id="tl-trim-back" ${busy || !selected ? 'disabled' : ''} title="Trim 0.5s from the back">Back ⟹</button>
-              <button type="button" class="btn btn-sm btn-secondary" id="tl-cut" ${busy || !selected ? 'disabled' : ''} title="Cut/split at playhead (S)">✂ Cut</button>
-              <button type="button" class="btn btn-sm btn-danger" id="tl-delete" ${busy || !selected ? 'disabled' : ''} title="Delete selected clip (Del)">🗑 Delete</button>
+              <button type="button" class="btn btn-sm btn-ghost" id="tl-trim-front" ${busy || !selected ? 'disabled' : ''} title="Trim 0.5s from front [">&#8656; Front</button>
+              <button type="button" class="btn btn-sm btn-ghost" id="tl-trim-back"  ${busy || !selected ? 'disabled' : ''} title="Trim 0.5s from back ]">Back &#8658;</button>
+              <button type="button" class="ce-cut-btn" id="tl-cut" ${busy || !selected ? 'disabled' : ''} title="Cut/split at playhead (S)">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14"><circle cx="6" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><line x1="20" y1="4" x2="8.12" y2="15.88"/><line x1="14.47" y1="14.48" x2="20" y2="20"/><line x1="8.12" y1="8.12" x2="12" y2="12"/></svg>
+                Split
+              </button>
+              <button type="button" class="btn btn-sm btn-danger" id="tl-delete" ${busy || !selected ? 'disabled' : ''} title="Delete selected (Del)">&#128465; Delete</button>
             </div>
+
             <div class="ce-zoom">
-              <button type="button" class="ce-icon-btn" id="ed-zoom-out">−</button>
+              <button type="button" class="ce-icon-btn" id="ed-zoom-out">&#8722;</button>
               <span>${Math.round((_editor.pxPerSec / 40) * 100)}%</span>
               <button type="button" class="ce-icon-btn" id="ed-zoom-in">+</button>
               <button type="button" class="ce-link" id="ed-zoom-fit">fit</button>
             </div>
             <button type="button" class="btn btn-sm btn-ghost" id="ed-reset-order" ${busy ? 'disabled' : ''}>Reset</button>
           </div>
-          <div class="ce-tl-scroll" id="ed-timeline-scroll">
-            <div class="ce-tl-inner" id="ed-track" style="width:${Math.max(640, total * _editor.pxPerSec + 48)}px">
-              <div class="ce-ruler" id="ed-ruler">${_ceRulerHtml(total)}</div>
-              <div class="ce-track-row">
-                ${_ceTrackHtml()}
+          <div class="ce-timeline-multi">
+            <!-- Left track headers -->
+            <div class="ce-timeline-headers">
+              <div class="ce-tl-header-spacer"></div>
+              <div class="ce-tl-track-header ce-header-video">
+                <span class="ce-hdr-icon">🎬</span>
+                <span class="ce-hdr-label">Video</span>
+              </div>
+              <div class="ce-tl-track-header ce-header-bgm">
+                <span class="ce-hdr-icon">🎵</span>
+                <span class="ce-hdr-label">BGM</span>
+              </div>
+              <div class="ce-tl-track-header ce-header-voice">
+                <span class="ce-hdr-icon">🎤</span>
+                <span class="ce-hdr-label">Voice</span>
+              </div>
+              <div class="ce-tl-track-header ce-header-captions">
+                <span class="ce-hdr-icon">💬</span>
+                <span class="ce-hdr-label">Texts</span>
+              </div>
+            </div>
+
+            <!-- Right timeline scroll area -->
+            <div class="ce-tl-scroll" id="ed-timeline-scroll">
+              <div class="ce-tl-inner" id="ed-track" style="width:${Math.max(640, total * _editor.pxPerSec + 48)}px">
+                <div class="ce-ruler" id="ed-ruler">${_ceRulerHtml(total)}</div>
+                
+                <!-- Track 1: Video clips -->
+                <div class="ce-track-row ce-row-video">
+                  ${_ceTrackHtml()}
+                </div>
+                
+                <!-- Track 2: BGM -->
+                <div class="ce-track-row ce-row-bgm">
+                  ${_ceBgmTrackHtml(total)}
+                </div>
+                
+                <!-- Track 3: Voice -->
+                <div class="ce-track-row ce-row-voice">
+                  ${_ceVoiceTrackHtml(total)}
+                </div>
+                
+                <!-- Track 4: Captions -->
+                <div class="ce-track-row ce-row-captions">
+                  ${_ceCaptionsTrackHtml()}
+                </div>
+                
                 <div class="ce-playhead" id="ed-playhead" style="left:${12 + _editor.playhead * _editor.pxPerSec}px"></div>
               </div>
             </div>
@@ -366,9 +500,10 @@ function _paintEditor() {
   _editor.video = document.getElementById('ed-video');
   _wireEditorEvents(busy);
 
-  // Restore preview frame for selection
+  // Restore preview frame for current playhead (no jump-to-clip-start)
   if (selected) {
-    _jumpToClip(selected.id, false);
+    _editorUpdatePlayheadUi();
+    _editorSeekPreview(_editor.playhead);
   }
 }
 
@@ -397,7 +532,13 @@ function _ceSidePanelHtml(selected, selMeta, busy) {
       <div class="ce-side-head">
         <h3>Story</h3>
         <p>All clips are assembled. Drag to re-order, click to select.</p>
-        <input type="search" id="ce-search" class="ce-search" placeholder="Search scenes…" value="${escAttr(_editor.search)}" ${busy ? 'disabled' : ''}/>
+        <div class="ce-story-header-row">
+          <input type="search" id="ce-search" class="ce-search" placeholder="Search scenes&hellip;" value="${escAttr(_editor.search)}" ${busy ? 'disabled' : ''}/>
+          <button type="button" class="btn btn-sm btn-primary ce-import-btn" id="ce-import-trigger" ${busy ? 'disabled' : ''} title="Import image or video">
+            ➕ Import
+          </button>
+          <input type="file" id="ce-import-file" accept="image/*,video/*" style="display:none;" />
+        </div>
       </div>
       <div class="ce-story-list" id="ce-story-list">
         ${list.map((item, i) => {
@@ -407,7 +548,7 @@ function _ceSidePanelHtml(selected, selMeta, busy) {
             <div class="ce-story-card ${active ? 'is-active' : ''}" data-id="${escAttr(item.id)}" draggable="${busy ? 'false' : 'true'}">
               <div class="ce-story-top">
                 <span>Scene ${i + 1}</span>
-                <button type="button" class="ce-mini-x" data-remove="${escAttr(item.id)}" title="Remove" ${busy ? 'disabled' : ''}>×</button>
+                <button type="button" class="ce-mini-x" data-remove="${escAttr(item.id)}" title="Remove" ${busy ? 'disabled' : ''}>&times;</button>
               </div>
               <p>${escHtml((m?.text || `Clip ${item.sourceIndex + 1}`).slice(0, 120))}</p>
               <div class="ce-story-meta">
@@ -449,7 +590,7 @@ function _ceSidePanelHtml(selected, selMeta, busy) {
 
           <label class="ce-trim-row">Trim from <strong>front</strong> (in-point)
             <div class="ce-trim-controls">
-              <button type="button" class="ce-nudge" id="ce-trim-front-minus" title="Cut 0.5s more from front" ${busy ? 'disabled' : ''}>−0.5s</button>
+              <button type="button" class="ce-nudge" id="ce-trim-front-minus" title="Cut 0.5s more from front" ${busy ? 'disabled' : ''}>-0.5s</button>
               <input type="range" id="ed-trim-start-range" min="0" max="${Math.max(0.05, maxDur - 0.05)}" step="0.05"
                 value="${t0.toFixed(2)}" ${busy ? 'disabled' : ''}/>
               <button type="button" class="ce-nudge" id="ce-trim-front-plus" title="Keep 0.5s more at front" ${busy ? 'disabled' : ''}>+0.5s</button>
@@ -460,7 +601,7 @@ function _ceSidePanelHtml(selected, selMeta, busy) {
 
           <label class="ce-trim-row">Trim from <strong>back</strong> (out-point)
             <div class="ce-trim-controls">
-              <button type="button" class="ce-nudge" id="ce-trim-back-minus" title="Cut 0.5s more from back" ${busy ? 'disabled' : ''}>−0.5s</button>
+              <button type="button" class="ce-nudge" id="ce-trim-back-minus" title="Cut 0.5s more from back" ${busy ? 'disabled' : ''}>-0.5s</button>
               <input type="range" id="ed-trim-end-range" min="0.05" max="${maxDur}" step="0.05"
                 value="${t1.toFixed(2)}" ${busy ? 'disabled' : ''}/>
               <button type="button" class="ce-nudge" id="ce-trim-back-plus" title="Keep 0.5s more at back" ${busy ? 'disabled' : ''}>+0.5s</button>
@@ -477,8 +618,8 @@ function _ceSidePanelHtml(selected, selMeta, busy) {
         </div>
 
         <div class="ce-edit-actions">
-          <button type="button" class="btn btn-sm btn-primary" id="ed-split" ${busy ? 'disabled' : ''}>✂ Cut / Split</button>
-          <button type="button" class="btn btn-sm btn-danger" id="ed-delete" ${busy ? 'disabled' : ''}>🗑 Delete clip</button>
+          <button type="button" class="btn btn-sm btn-primary" id="ed-split" ${busy ? 'disabled' : ''}>&#9986; Cut / Split</button>
+          <button type="button" class="btn btn-sm btn-danger" id="ed-delete" ${busy ? 'disabled' : ''}>&#128465; Delete clip</button>
         </div>
 
         <label>Transition in
@@ -493,13 +634,18 @@ function _ceSidePanelHtml(selected, selMeta, busy) {
             value="${Number(selected.transitionDuration || 0.35).toFixed(2)}"
             ${busy || (selected.transition || 'none') === 'none' ? 'disabled' : ''}/>
         </label>
-        <p class="ce-hint">Source ${_fmtEditorTime(maxDur)}. Drag the <strong>left</strong> or <strong>right</strong> edges on the timeline to trim. <kbd>S</kbd> cut · <kbd>Del</kbd> delete.</p>
+        <p class="ce-hint">Source ${_fmtEditorTime(maxDur)}. Drag the <strong>left</strong> or <strong>right</strong> edges on the timeline to trim. <kbd>S</kbd> cut &middot; <kbd>Del</kbd> delete.</p>
       </div>`;
   }
 
   if (tab === 'audio') {
+    const bgm = _editor.timeline.bgMusic || {};
+    const vt  = _editor.timeline.voiceTrack || {};
     return `
-      <div class="ce-side-head"><h3>Audio</h3><p>Choose the audio bed mixed into the final render.</p></div>
+      <div class="ce-side-head">
+        <h3>Audio</h3>
+        <p>Add background music or a voice track to your video.</p>
+      </div>
       <div class="ce-fields">
         <label>Audio mode
           <select id="ed-audio-mode" ${busy ? 'disabled' : ''}>
@@ -508,7 +654,85 @@ function _ceSidePanelHtml(selected, selMeta, busy) {
             <option value="silent" ${_editor.timeline.audioMode === 'silent' ? 'selected' : ''}>Silent / clip audio only</option>
           </select>
         </label>
-        <p class="ce-hint">Preview in the browser plays clip video only. The chosen audio bed is applied during Render.</p>
+
+        <!-- Background Music card -->
+        <div class="ce-audio-card">
+          <div class="ce-audio-card-header">
+            <div class="ce-audio-card-icon ce-audio-icon-music">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="18" height="18">
+                <path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/>
+              </svg>
+            </div>
+            <div class="ce-audio-card-info">
+              <div class="ce-audio-card-title">Background Music</div>
+              <div class="ce-audio-card-sub">${bgm.filename ? escHtml(bgm.filename) : 'No file selected'}</div>
+            </div>
+            <label class="ce-audio-toggle" title="${bgm.enabled ? 'Disable BGM' : 'Enable BGM'}">
+              <input type="checkbox" id="ce-bgm-enabled" ${bgm.enabled ? 'checked' : ''} ${busy ? 'disabled' : ''}/>
+              <span class="ce-toggle-pill"></span>
+            </label>
+          </div>
+          <div class="ce-audio-drop-zone ${bgm.filename ? 'has-file' : ''}" id="ce-bgm-drop">
+            <input type="file" id="ce-bgm-file" accept="audio/*" class="ce-audio-file-input" ${busy ? 'disabled' : ''}/>
+            <div class="ce-audio-drop-content">
+              ${bgm.filename
+                ? `<div class="ce-audio-file-name">&#127925; ${escHtml(bgm.filename)}</div>`
+                : `<div class="ce-audio-drop-icon">&#127925;</div>
+                   <div class="ce-audio-drop-text">Drop MP3 / AAC / WAV here</div>
+                   <div class="ce-audio-drop-sub">or click to browse</div>`
+              }
+            </div>
+          </div>
+          ${bgm.filename ? `
+          <div class="ce-audio-vol-row">
+            <label class="ce-audio-vol-label">Volume</label>
+            <input type="range" id="ce-bgm-vol" min="0" max="1" step="0.05" value="${Number(bgm.volume ?? 0.4).toFixed(2)}" ${busy ? 'disabled' : ''}/>
+            <span id="ce-bgm-vol-val" class="ce-audio-vol-val">${Math.round(Number(bgm.volume ?? 0.4) * 100)}%</span>
+          </div>
+          <button type="button" class="ce-audio-remove-btn" id="ce-bgm-remove" ${busy ? 'disabled' : ''}>&times; Remove track</button>
+          ` : ''}
+        </div>
+
+        <!-- Voice / Narration card -->
+        <div class="ce-audio-card">
+          <div class="ce-audio-card-header">
+            <div class="ce-audio-card-icon ce-audio-icon-voice">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="18" height="18">
+                <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
+                <path d="M19 10v2a7 7 0 0 1-14 0v-2M12 19v4M8 23h8"/>
+              </svg>
+            </div>
+            <div class="ce-audio-card-info">
+              <div class="ce-audio-card-title">Voice / Narration</div>
+              <div class="ce-audio-card-sub">${vt.filename ? escHtml(vt.filename) : 'No file selected'}</div>
+            </div>
+            <label class="ce-audio-toggle" title="${vt.enabled ? 'Disable voice track' : 'Enable voice track'}">
+              <input type="checkbox" id="ce-vt-enabled" ${vt.enabled ? 'checked' : ''} ${busy ? 'disabled' : ''}/>
+              <span class="ce-toggle-pill"></span>
+            </label>
+          </div>
+          <div class="ce-audio-drop-zone ${vt.filename ? 'has-file' : ''}" id="ce-vt-drop">
+            <input type="file" id="ce-vt-file" accept="audio/*" class="ce-audio-file-input" ${busy ? 'disabled' : ''}/>
+            <div class="ce-audio-drop-content">
+              ${vt.filename
+                ? `<div class="ce-audio-file-name">&#127908; ${escHtml(vt.filename)}</div>`
+                : `<div class="ce-audio-drop-icon">&#127908;</div>
+                   <div class="ce-audio-drop-text">Drop MP3 / AAC / WAV here</div>
+                   <div class="ce-audio-drop-sub">or click to browse</div>`
+              }
+            </div>
+          </div>
+          ${vt.filename ? `
+          <div class="ce-audio-vol-row">
+            <label class="ce-audio-vol-label">Volume</label>
+            <input type="range" id="ce-vt-vol" min="0" max="1" step="0.05" value="${Number(vt.volume ?? 1.0).toFixed(2)}" ${busy ? 'disabled' : ''}/>
+            <span id="ce-vt-vol-val" class="ce-audio-vol-val">${Math.round(Number(vt.volume ?? 1.0) * 100)}%</span>
+          </div>
+          <button type="button" class="ce-audio-remove-btn" id="ce-vt-remove" ${busy ? 'disabled' : ''}>&times; Remove track</button>
+          ` : ''}
+        </div>
+
+        <p class="ce-hint">Audio files are uploaded and mixed during Render. Preview plays clip video only.</p>
       </div>`;
   }
 
@@ -535,7 +759,7 @@ function _ceSidePanelHtml(selected, selMeta, busy) {
             `).join('')}
           </div>
         </label>
-        <p class="ce-hint">Uses the job’s caption track (ASS) when present. Position/style are saved for future advanced burn-in.</p>
+        <p class="ce-hint">Uses the job's caption track (ASS) when present.</p>
       </div>`;
   }
 
@@ -560,7 +784,7 @@ function _ceSidePanelHtml(selected, selMeta, busy) {
       <button type="button" class="btn btn-sm btn-secondary" id="ce-apply-trans-all" ${busy ? 'disabled' : ''}>
         Apply default transition to all cuts
       </button>
-      <p class="ce-hint">Space = play/pause · Drag timeline to scrub · Ctrl+Z undo</p>
+      <p class="ce-hint">Space = play/pause &middot; Drag timeline to scrub &middot; Ctrl+Z undo</p>
     </div>`;
 }
 
@@ -589,10 +813,14 @@ function _ceTrackHtml() {
     const frontPct = maxDur > 0 ? Math.min(40, ((item.trimStart || 0) / maxDur) * 100) : 0;
     const backPct = maxDur > 0 ? Math.min(40, (Math.max(0, maxDur - (item.trimEnd || maxDur)) / maxDur) * 100) : 0;
     const transBadge = item.transition && item.transition !== 'none'
-      ? `<span class="ce-trans-badge" title="${escAttr(item.transition)}">↝</span>` : '';
+      ? `<span class="ce-trans-badge" title="${escAttr(item.transition)}">&#8631;</span>` : '';
+    
+    // Resolve cache-busted AI-generated thumbnail url for clip
+    const frameUrl = mediaUrl(`/api/jobs/${_editor.jobId}/preview/frame/${item.sourceIndex}`);
+
     return `
       <div class="ce-clip${selected}" data-id="${escAttr(item.id)}"
-        style="left:${left}px;width:${w}px;--clip-color:${color}">
+        style="left:${left}px;width:${w}px;--clip-color:${color};background-image:linear-gradient(rgba(0,0,0,0.52), rgba(0,0,0,0.72)), url('${frameUrl}');background-size:cover;background-position:center;">
         ${transBadge}
         <div class="ce-clip-handle ce-clip-handle-l" data-handle="start" title="Drag to trim from FRONT">
           <span class="ce-handle-grip"></span>
@@ -610,11 +838,54 @@ function _ceTrackHtml() {
   }).join('');
 }
 
+function _ceBgmTrackHtml(total) {
+  const bgm = _editor.timeline.bgMusic;
+  if (!bgm || !bgm.filename || bgm.enabled === false) return '';
+  const w = total * _editor.pxPerSec;
+  return `
+    <div class="ce-audio-track-bar ce-bgm-bar" style="left:12px;width:${w}px">
+      <span class="ce-audio-track-icon">🎵</span>
+      <span class="ce-audio-track-name">${escHtml(bgm.filename)}</span>
+      <span class="ce-audio-track-vol">Volume: ${Math.round((bgm.volume ?? 0.4) * 100)}%</span>
+    </div>`;
+}
+
+function _ceVoiceTrackHtml(total) {
+  const vt = _editor.timeline.voiceTrack;
+  if (!vt || !vt.filename || vt.enabled === false) return '';
+  const w = total * _editor.pxPerSec;
+  return `
+    <div class="ce-audio-track-bar ce-voice-bar" style="left:12px;width:${w}px">
+      <span class="ce-audio-track-icon">🎤</span>
+      <span class="ce-audio-track-name">${escHtml(vt.filename)}</span>
+      <span class="ce-audio-track-vol">Volume: ${Math.round((vt.volume ?? 1.0) * 100)}%</span>
+    </div>`;
+}
+
+function _ceCaptionsTrackHtml() {
+  if (!_editor.timeline.captions?.enabled) return '';
+  let x = 12;
+  return _editor.timeline.clips.map((item) => {
+    if (item.enabled === false) return '';
+    const dur = _clipDuration(item);
+    const w = Math.max(40, dur * _editor.pxPerSec);
+    const left = x;
+    x += w + 2;
+    const meta = _sourceMeta(item.sourceIndex);
+    if (!meta?.text) return '';
+    return `
+      <div class="ce-caption-track-bar" style="left:${left}px;width:${w}px" title="${escAttr(meta.text)}">
+        <span>${escHtml(meta.text.slice(0, 30))}</span>
+      </div>`;
+  }).join('');
+}
+
+
 function _ceRenderBannerHtml(er) {
   if (!er || !er.status || er.status === 'idle') {
     if (_editor?.assets?.edited) {
       return `<div class="edit-render-banner edit-render-done">
-        Last edit ready —
+        Last edit ready &mdash;
         <a href="${escAttr(mediaUrl(`/api/jobs/${_editor.jobId}/download/edited`))}" download>Download</a>
       </div>`;
     }
@@ -626,7 +897,7 @@ function _ceRenderBannerHtml(er) {
     const total = er.progress?.total ?? 0;
     return `<div class="edit-render-banner edit-render-busy">
       <strong>Rendering on server</strong>
-      <span>(${escHtml(String(phase))}${total ? ` · ${done}/${total}` : ''}). Safe to leave — return anytime.</span>
+      <span>(${escHtml(String(phase))}${total ? ` &middot; ${done}/${total}` : ''}). Safe to leave &mdash; return anytime.</span>
     </div>`;
   }
   if (er.status === 'failed') {
@@ -637,14 +908,13 @@ function _ceRenderBannerHtml(er) {
   if (er.status === 'done') {
     return `<div class="edit-render-banner edit-render-done">
       <strong>Render complete!</strong>
-      <a class="btn btn-sm btn-primary" href="${escAttr(mediaUrl(`/api/jobs/${_editor.jobId}/download/edited`))}" download>⬇ Download</a>
+      <a class="btn btn-sm btn-primary" href="${escAttr(mediaUrl(`/api/jobs/${_editor.jobId}/download/edited`))}" download>&#8595; Download</a>
     </div>`;
   }
   return '';
 }
 
 function _ceRenderOverlayHtml(er) {
-  // Non-blocking strip already shows status; only show modal for active render or result once
   if (er.status === 'queued' || er.status === 'rendering') {
     const pct = er.progress?.total
       ? Math.round(100 * (er.progress.done || 0) / er.progress.total)
@@ -653,8 +923,8 @@ function _ceRenderOverlayHtml(er) {
       <div class="ce-overlay" id="ce-overlay-modal">
         <div class="ce-modal">
           <div class="ce-spinner"></div>
-          <h3>Rendering your video…</h3>
-          <p>${escHtml(er.progress?.phase || er.status)} — keep going offline if you want</p>
+          <h3>Rendering your video&hellip;</h3>
+          <p>${escHtml(er.progress?.phase || er.status)} &mdash; keep going offline if you want</p>
           <div class="ce-progress"><div style="width:${pct}%"></div></div>
           <p class="ce-hint">You can close this tab. The worker keeps rendering; download when you return.</p>
           <button type="button" class="btn btn-ghost" id="ce-dismiss-overlay">Work in background</button>
@@ -665,7 +935,7 @@ function _ceRenderOverlayHtml(er) {
     return `
       <div class="ce-overlay" id="ce-overlay-modal">
         <div class="ce-modal">
-          <div class="ce-success-icon">✓</div>
+          <div class="ce-success-icon">&#10003;</div>
           <h3>Render complete!</h3>
           <video controls class="ce-modal-video" src="${escAttr(mediaUrl(`/api/jobs/${_editor.jobId}/preview/edited`))}"></video>
           <div class="ce-modal-actions">
@@ -679,7 +949,7 @@ function _ceRenderOverlayHtml(er) {
     return `
       <div class="ce-overlay" id="ce-overlay-modal">
         <div class="ce-modal">
-          <div class="ce-fail-icon">✕</div>
+          <div class="ce-fail-icon">&#10007;</div>
           <h3>Render failed</h3>
           <p>${escHtml(er.error || 'Unknown error')}</p>
           <button type="button" class="btn btn-ghost" id="ce-dismiss-overlay">Close</button>
@@ -697,8 +967,21 @@ function _wireEditorEvents(busy) {
   document.getElementById('ce-redo')?.addEventListener('click', () => _editorRedo());
   document.getElementById('ce-save')?.addEventListener('click', () => _editorSave());
   document.getElementById('ce-render')?.addEventListener('click', () => _editorRender());
+
+  // Transport controls
   document.getElementById('ed-play')?.addEventListener('click', () => _editorTogglePlay());
-  document.getElementById('ed-stop')?.addEventListener('click', () => { _editorStop(); _editor.playhead = 0; _editorUpdatePlayheadUi(); });
+  document.getElementById('ed-stop')?.addEventListener('click', () => {
+    _editorStop();
+    // Stop leaves playhead where it is — does NOT reset to 0
+  });
+  document.getElementById('ed-restart')?.addEventListener('click', () => {
+    _editorStop();
+    _editor.playhead = 0;
+    _editorUpdatePlayheadUi();
+    _editorSeekPreview(0);
+    setTimeout(() => _editorTogglePlay(), 80);
+  });
+
   document.getElementById('ed-zoom-in')?.addEventListener('click', () => { _editor.pxPerSec = Math.min(140, _editor.pxPerSec + 12); _paintEditor(); });
   document.getElementById('ed-zoom-out')?.addEventListener('click', () => { _editor.pxPerSec = Math.max(14, _editor.pxPerSec - 12); _paintEditor(); });
   document.getElementById('ed-zoom-fit')?.addEventListener('click', () => {
@@ -721,16 +1004,24 @@ function _wireEditorEvents(busy) {
 
   document.getElementById('ce-search')?.addEventListener('input', (e) => {
     _editor.search = e.target.value;
-    // soft refresh list only
     _paintEditor();
     const s = document.getElementById('ce-search');
     if (s) { s.focus(); s.selectionStart = s.selectionEnd = s.value.length; }
   });
 
+  // Wire import media trigger
+  document.getElementById('ce-import-trigger')?.addEventListener('click', () => {
+    document.getElementById('ce-import-file')?.click();
+  });
+  document.getElementById('ce-import-file')?.addEventListener('change', (e) => {
+    const file = e.target.files?.[0];
+    if (file) _editorImportMedia(file);
+  });
+
   document.getElementById('ce-prev')?.addEventListener('click', () => _editorStepClip(-1));
   document.getElementById('ce-next')?.addEventListener('click', () => _editorStepClip(1));
 
-  // Timeline edit tools (always visible)
+  // Timeline edit tools
   document.getElementById('tl-trim-front')?.addEventListener('click', () => _editorNudgeTrim('front', 0.5));
   document.getElementById('tl-trim-back')?.addEventListener('click', () => _editorNudgeTrim('back', 0.5));
   document.getElementById('tl-cut')?.addEventListener('click', () => _editorSplitAtPlayhead());
@@ -809,6 +1100,82 @@ function _wireEditorEvents(busy) {
       _editorPushHistory();
     });
 
+    // ── Audio track events ──────────────────────────────────────
+    // BGM toggle
+    document.getElementById('ce-bgm-enabled')?.addEventListener('change', (e) => {
+      _editor.timeline.bgMusic = _editor.timeline.bgMusic || {};
+      _editor.timeline.bgMusic.enabled = e.target.checked;
+      _editorPushHistory();
+    });
+    // BGM file pick
+    document.getElementById('ce-bgm-file')?.addEventListener('change', (e) => {
+      const file = e.target.files?.[0];
+      if (file) _editorUploadAudioTrack('bgMusic', file);
+    });
+    document.getElementById('ce-bgm-drop')?.addEventListener('click', (e) => {
+      if (!e.target.closest('input')) document.getElementById('ce-bgm-file')?.click();
+    });
+    document.getElementById('ce-bgm-drop')?.addEventListener('dragover', (e) => {
+      e.preventDefault(); e.currentTarget.classList.add('drag-over');
+    });
+    document.getElementById('ce-bgm-drop')?.addEventListener('dragleave', (e) => {
+      e.currentTarget.classList.remove('drag-over');
+    });
+    document.getElementById('ce-bgm-drop')?.addEventListener('drop', (e) => {
+      e.preventDefault(); e.currentTarget.classList.remove('drag-over');
+      const file = e.dataTransfer.files?.[0];
+      if (file && file.type.startsWith('audio/')) _editorUploadAudioTrack('bgMusic', file);
+    });
+    document.getElementById('ce-bgm-vol')?.addEventListener('input', (e) => {
+      _editor.timeline.bgMusic = _editor.timeline.bgMusic || {};
+      _editor.timeline.bgMusic.volume = Number(e.target.value);
+      const val = document.getElementById('ce-bgm-vol-val');
+      if (val) val.textContent = `${Math.round(Number(e.target.value) * 100)}%`;
+    });
+    document.getElementById('ce-bgm-vol')?.addEventListener('change', () => _editorPushHistory());
+    document.getElementById('ce-bgm-remove')?.addEventListener('click', () => {
+      _editor.timeline.bgMusic = { enabled: false, filename: '', volume: 0.4, url: '' };
+      _editorPushHistory();
+      _paintEditor();
+    });
+
+    // Voice track
+    document.getElementById('ce-vt-enabled')?.addEventListener('change', (e) => {
+      _editor.timeline.voiceTrack = _editor.timeline.voiceTrack || {};
+      _editor.timeline.voiceTrack.enabled = e.target.checked;
+      _editorPushHistory();
+    });
+    document.getElementById('ce-vt-file')?.addEventListener('change', (e) => {
+      const file = e.target.files?.[0];
+      if (file) _editorUploadAudioTrack('voiceTrack', file);
+    });
+    document.getElementById('ce-vt-drop')?.addEventListener('click', (e) => {
+      if (!e.target.closest('input')) document.getElementById('ce-vt-file')?.click();
+    });
+    document.getElementById('ce-vt-drop')?.addEventListener('dragover', (e) => {
+      e.preventDefault(); e.currentTarget.classList.add('drag-over');
+    });
+    document.getElementById('ce-vt-drop')?.addEventListener('dragleave', (e) => {
+      e.currentTarget.classList.remove('drag-over');
+    });
+    document.getElementById('ce-vt-drop')?.addEventListener('drop', (e) => {
+      e.preventDefault(); e.currentTarget.classList.remove('drag-over');
+      const file = e.dataTransfer.files?.[0];
+      if (file && file.type.startsWith('audio/')) _editorUploadAudioTrack('voiceTrack', file);
+    });
+    document.getElementById('ce-vt-vol')?.addEventListener('input', (e) => {
+      _editor.timeline.voiceTrack = _editor.timeline.voiceTrack || {};
+      _editor.timeline.voiceTrack.volume = Number(e.target.value);
+      const val = document.getElementById('ce-vt-vol-val');
+      if (val) val.textContent = `${Math.round(Number(e.target.value) * 100)}%`;
+    });
+    document.getElementById('ce-vt-vol')?.addEventListener('change', () => _editorPushHistory());
+    document.getElementById('ce-vt-remove')?.addEventListener('click', () => {
+      _editor.timeline.voiceTrack = { enabled: false, filename: '', volume: 1.0, url: '' };
+      _editorPushHistory();
+      _paintEditor();
+    });
+
     const bindTrimStart = (raw) => {
       const item = _editorSelected();
       if (!item) return;
@@ -835,7 +1202,6 @@ function _wireEditorEvents(busy) {
     document.getElementById('ed-trim-start')?.addEventListener('change', (e) => bindTrimStart(e.target.value));
     document.getElementById('ed-trim-end')?.addEventListener('change', (e) => bindTrimEnd(e.target.value));
     document.getElementById('ed-trim-start-range')?.addEventListener('input', (e) => {
-      // live preview while dragging slider (no history until change)
       const item = _editorSelected();
       if (!item) return;
       const meta = _sourceMeta(item.sourceIndex);
@@ -868,10 +1234,8 @@ function _wireEditorEvents(busy) {
       _paintEditor();
     });
 
-    // Front: −0.5s means cut more (increase trimStart)
     document.getElementById('ce-trim-front-minus')?.addEventListener('click', () => _editorNudgeTrim('front', 0.5));
     document.getElementById('ce-trim-front-plus')?.addEventListener('click', () => _editorNudgeTrim('front', -0.5));
-    // Back: −0.5s means cut more (decrease trimEnd)
     document.getElementById('ce-trim-back-minus')?.addEventListener('click', () => _editorNudgeTrim('back', 0.5));
     document.getElementById('ce-trim-back-plus')?.addEventListener('click', () => _editorNudgeTrim('back', -0.5));
 
@@ -948,7 +1312,7 @@ function _wireEditorEvents(busy) {
     });
   }
 
-  // Timeline clips — handles trim front/back; body reorders
+  // Timeline clips
   const track = document.getElementById('ed-track');
   const scroll = document.getElementById('ed-timeline-scroll');
   if (track) {
@@ -986,8 +1350,11 @@ function _wireEditorEvents(busy) {
           if (busy) return;
           e.preventDefault();
           e.stopPropagation();
+          // Capture pointer on the handle itself before handing off,
+          // so pointermove keeps firing even when the cursor leaves the element
+          try { handle.setPointerCapture(e.pointerId); } catch (_) {}
           _editor.selectedId = el.dataset.id;
-          _editorStartTrimDrag(el.dataset.id, handle.dataset.handle, e);
+          _editorStartTrimDrag(el.dataset.id, handle.dataset.handle, e, handle);
         });
       });
     });
@@ -1009,7 +1376,6 @@ function _wireEditorEvents(busy) {
       _editor.playhead = Math.max(0, Math.min(total, x / _editor.pxPerSec));
       _editorUpdatePlayheadUi();
       _editorSeekPreview(_editor.playhead);
-      // select clip under playhead
       const seg = _editorSegAt(_editor.playhead);
       if (seg && seg.item.id !== _editor.selectedId) {
         _editor.selectedId = seg.item.id;
@@ -1018,7 +1384,7 @@ function _wireEditorEvents(busy) {
 
     scroll.addEventListener('pointerdown', (e) => {
       if (e.target.closest('.ce-clip-handle')) return;
-      if (e.target.closest('.ce-clip') && !e.shiftKey) return; // clip click selects; shift-scrub anywhere
+      if (e.target.closest('.ce-clip') && !e.shiftKey) return;
       _editor.scrubbing = true;
       scrub(e.clientX);
       scroll.setPointerCapture?.(e.pointerId);
@@ -1032,6 +1398,111 @@ function _wireEditorEvents(busy) {
   }
 }
 
+async function _editorImportMedia(file) {
+  if (!file || !_editor) return;
+  const maxSize = 300 * 1024 * 1024; // 300 MB
+  if (file.size > maxSize) {
+    showToast('Import file too large (max 300 MB).', 'error');
+    return;
+  }
+
+  // Show loading indicator in place of the story cards
+  const listEl = document.getElementById('ce-story-list');
+  const originalListHtml = listEl ? listEl.innerHTML : '';
+  if (listEl) {
+    listEl.innerHTML = `
+      <div style="padding:40px 20px;text-align:center;color:var(--clr-text-3);">
+        <div class="ce-spinner" style="width:28px;height:28px;margin:0 auto 12px;"></div>
+        <p style="font-size:12px;font-weight:600;color:var(--clr-text-2);margin-bottom:4px;">Importing media...</p>
+        <span style="font-size:10px;color:var(--clr-text-3);">Transcoding to 1080p 24fps on server</span>
+      </div>`;
+  }
+
+  try {
+    const formData = new FormData();
+    formData.append('importFile', file);
+
+    const resp = await apiFetch(`/api/jobs/${_editor.jobId}/editor/import`, {
+      method: 'POST',
+      body: formData,
+    });
+
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      throw new Error(err.error || `Import failed (${resp.status})`);
+    }
+
+    const data = await resp.json();
+    _editor.sourceClips = data.clips || [];
+    _editor.clipsByIndex = new Map((data.clips || []).map(c => [c.index, c]));
+    _editor.timeline = data.timeline;
+
+    const newClip = data.timeline.clips[data.timeline.clips.length - 1];
+    if (newClip) {
+      _editor.selectedId = newClip.id;
+      _jumpToClip(newClip.id, true);
+    }
+
+    _editorPushHistory();
+    showToast('Media imported and converted successfully!', 'success');
+  } catch (err) {
+    showToast(err.message, 'error');
+    if (listEl) listEl.innerHTML = originalListHtml;
+  }
+  _paintEditor();
+}
+
+// ── Audio upload ────────────────────────────────────────────
+async function _editorUploadAudioTrack(trackKey, file) {
+  if (!file || !_editor) return;
+  if (file.size > 300 * 1024 * 1024) {
+    showToast('Audio file too large (max 300 MB).', 'error');
+    return;
+  }
+
+  const dropId = trackKey === 'bgMusic' ? 'ce-bgm-drop' : 'ce-vt-drop';
+  const dropEl = document.getElementById(dropId);
+  if (dropEl) {
+    dropEl.innerHTML = `<div class="ce-audio-drop-content"><div class="ce-spinner" style="width:24px;height:24px;margin:0 auto 6px"></div><div class="ce-audio-drop-sub">Uploading&hellip;</div></div>`;
+  }
+
+  try {
+    const formData = new FormData();
+    formData.append('audioTrack', file);
+    formData.append('trackType', trackKey);
+    const resp = await apiFetch(`/api/jobs/${_editor.jobId}/editor/audio`, {
+      method: 'POST',
+      body: formData,
+    });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      throw new Error(err.error || `Upload failed (${resp.status})`);
+    }
+    const data = await resp.json();
+    _editor.timeline[trackKey] = {
+      ..._editor.timeline[trackKey],
+      enabled: true,
+      filename: file.name,
+      url: data.url || '',
+      serverPath: data.path || '',
+    };
+    showToast(`${trackKey === 'bgMusic' ? 'Background music' : 'Voice track'} uploaded!`, 'success');
+  } catch (err) {
+    // Graceful fallback: store a local blob URL (preview only, server upload TBD)
+    const localUrl = URL.createObjectURL(file);
+    _editor.timeline[trackKey] = {
+      ..._editor.timeline[trackKey],
+      enabled: true,
+      filename: file.name,
+      url: localUrl,
+      serverPath: '',
+    };
+    showToast(`${trackKey === 'bgMusic' ? 'Music' : 'Voice'} loaded locally. Server upload endpoint not yet configured — will apply at render when available.`, 'info', 5000);
+  }
+  _editorPushHistory();
+  _paintEditor();
+}
+
 function _editorStepClip(dir) {
   const enabled = _editorEnabledClips();
   if (!enabled.length) return;
@@ -1043,7 +1514,6 @@ function _editorStepClip(dir) {
   _paintEditor();
 }
 
-/** Nudge trim: amount>0 cuts more from that edge; amount<0 restores. */
 function _editorNudgeTrim(edge, amount) {
   const item = _editorSelected();
   if (!item || item.enabled === false) {
@@ -1110,7 +1580,6 @@ function _editorDeleteSelected(hard) {
     }
     const next = _editorEnabledClips()[0];
     _editor.selectedId = next?.id || null;
-    // first clip: no transition-in
     const en = _editorEnabledClips();
     if (en[0]) {
       en[0].transition = 'none';
@@ -1157,7 +1626,6 @@ function _editorReorder(fromId, toId) {
   if (from < 0 || to < 0 || from === to) return;
   const [moved] = clips.splice(from, 1);
   clips.splice(to, 0, moved);
-  // Fix first clip transition
   const enabled = clips.filter(c => c.enabled !== false);
   if (enabled[0]) {
     enabled[0].transition = 'none';
@@ -1167,30 +1635,36 @@ function _editorReorder(fromId, toId) {
   _paintEditor();
 }
 
-function _editorStartTrimDrag(id, which, e) {
+function _editorStartTrimDrag(id, which, e, handleEl) {
   const item = _editor.timeline.clips.find(c => c.id === id);
   if (!item) return;
   const meta = _sourceMeta(item.sourceIndex);
   const maxDur = meta?.duration || item.trimEnd || 10;
   const startX = e.clientX;
-  const origStart = item.trimStart || 0;
-  const origEnd = item.trimEnd || maxDur;
+  // Snapshot trim values at drag-start so delta math is always relative to origin
+  const origStart = Number(item.trimStart || 0);
+  const origEnd   = Number(item.trimEnd   || maxDur);
+
   _editor.trimming = true;
   document.body.classList.add('ce-trimming');
   const clipEl = document.querySelector(`.ce-clip[data-id="${CSS.escape(id)}"]`);
   clipEl?.classList.add('is-trimming');
 
-  // Capture pointer so drag stays smooth even outside the handle
-  try { e.currentTarget?.setPointerCapture?.(e.pointerId); } catch (_) {}
-
+  // Pointer capture was already set on handleEl before calling this function.
+  // Attach move/up to window so we never miss events even if cursor races ahead.
   const onMove = (ev) => {
+    // Guard: only respond to the same pointer that started the drag
     const dx = (ev.clientX - startX) / _editor.pxPerSec;
     if (which === 'start') {
-      // Drag left handle right → cut front (raise trimStart)
-      item.trimStart = Number(Math.max(0, Math.min(origStart + dx, origEnd - 0.1)).toFixed(3));
+      // Left handle → move in-point (trimStart)
+      item.trimStart = Number(
+        Math.max(0, Math.min(origStart + dx, origEnd - 0.1)).toFixed(3)
+      );
     } else {
-      // Drag right handle left → cut back (lower trimEnd)
-      item.trimEnd = Number(Math.min(maxDur, Math.max(origEnd + dx, origStart + 0.1)).toFixed(3));
+      // Right handle → move out-point (trimEnd)
+      item.trimEnd = Number(
+        Math.min(maxDur, Math.max(origEnd + dx, origStart + 0.1)).toFixed(3)
+      );
     }
     _editor.dirty = true;
     _refreshClipGeometry();
@@ -1198,23 +1672,22 @@ function _editorStartTrimDrag(id, which, e) {
 
   const onUp = () => {
     window.removeEventListener('pointermove', onMove);
-    window.removeEventListener('pointerup', onUp);
+    window.removeEventListener('pointerup',   onUp);
     window.removeEventListener('pointercancel', onUp);
     _editor.trimming = false;
     document.body.classList.remove('ce-trimming');
     clipEl?.classList.remove('is-trimming');
     _editorPushHistory();
     _paintEditor();
-    // Preview the new in/out edge
     _jumpToClip(id, true);
   };
+
   window.addEventListener('pointermove', onMove);
-  window.addEventListener('pointerup', onUp);
+  window.addEventListener('pointerup',   onUp);
   window.addEventListener('pointercancel', onUp);
 }
 
 function _editorSplitAtPlayhead() {
-  // Prefer clip under playhead; fall back to selection
   let item = _editorSegAt(_editor.playhead)?.item || _editorSelected();
   if (!item || item.enabled === false) {
     showToast('Select a clip (or put the playhead on one) to cut.', 'info');
@@ -1234,6 +1707,10 @@ function _editorSplitAtPlayhead() {
     showToast('Move the red playhead inside the clip, then Cut.', 'info');
     return;
   }
+
+  // ── KEY FIX: save playhead before any repaint ──────────────
+  const savedPlayhead = _editor.playhead;
+
   const cutAt = (item.trimStart || 0) + local;
   const right = {
     ...item,
@@ -1247,8 +1724,14 @@ function _editorSplitAtPlayhead() {
   _editor.timeline.clips.splice(idx + 1, 0, right);
   _editor.selectedId = right.id;
   _editorPushHistory();
+
+  // Repaint (which re-renders DOM) then restore exact playhead position
   _paintEditor();
-  showToast('Cut into two clips. Trim or delete either side.', 'success');
+  _editor.playhead = savedPlayhead;
+  _editorUpdatePlayheadUi();
+  // Do NOT re-seek video here — keep the current frame in view
+
+  showToast('Split! Trim or delete either side.', 'success');
 }
 
 function _jumpToClip(id, seekVideo = true) {
@@ -1271,7 +1754,7 @@ function _editorUpdatePlayheadUi() {
   const cur = document.getElementById('ed-time-cur');
   if (cur) cur.textContent = _fmtEditorTime(_editor.playhead);
 
-  // Auto-scroll timeline
+  // Auto-scroll timeline to keep playhead visible during playback
   const scroll = document.getElementById('ed-timeline-scroll');
   if (scroll && _editor.playing) {
     const px = 12 + _editor.playhead * _editor.pxPerSec;
@@ -1280,7 +1763,7 @@ function _editorUpdatePlayheadUi() {
     else if (px > scrollLeft + clientWidth - 80) scroll.scrollLeft = px - clientWidth + 80;
   }
 
-  // Live caption line from narration
+  // Live caption
   const cap = document.getElementById('ce-live-caption');
   const seg = _editorSegAt(_editor.playhead);
   if (cap) {
@@ -1346,6 +1829,15 @@ async function _editorSeekPreview(time) {
       video.currentTime = Math.min(srcTime, Math.max(0, (video.duration || srcTime) - 0.05));
     }
   } catch (_) {}
+  
+  // Sync custom BGM/Voice playhead on scrub/seek
+  if (_editor?.bgMusicElement) {
+    _safeSeekAudio(_editor.bgMusicElement, time);
+  }
+  if (_editor?.voiceTrackElement) {
+    _safeSeekAudio(_editor.voiceTrackElement, time);
+  }
+
   document.getElementById('ed-overlay')?.classList.add('hidden');
 }
 
@@ -1359,8 +1851,14 @@ async function _editorTogglePlay() {
     return;
   }
   _editor.playing = true;
+
+  // Immediately flip the button to pause (don't wait for full repaint)
   const btn = document.getElementById('ed-play');
-  if (btn) { btn.textContent = '⏸ Pause'; btn.classList.add('btn-danger'); btn.classList.remove('btn-primary'); }
+  if (btn) {
+    btn.classList.add('is-playing');
+    btn.title = 'Pause (Space)';
+    btn.innerHTML = '<svg viewBox="0 0 24 24" fill="currentColor" width="18" height="18"><path d="M6 19h4V5H6zm8-14v14h4V5z"/></svg>';
+  }
   document.getElementById('ed-overlay')?.classList.add('hidden');
 
   const video = _editor.video;
@@ -1402,10 +1900,32 @@ async function _editorTogglePlay() {
     } else {
       _editor.playhead += 0.04;
     }
+
+    // Dynamic BGM/Voice synchronization checks
+    if (bgmAud && bgmAud.readyState >= 1 && Math.abs(bgmAud.currentTime - _editor.playhead) > 0.22) {
+      try { bgmAud.currentTime = _editor.playhead; } catch (_) {}
+    }
+    if (voiceAud && voiceAud.readyState >= 1 && Math.abs(voiceAud.currentTime - _editor.playhead) > 0.22) {
+      try { voiceAud.currentTime = _editor.playhead; } catch (_) {}
+    }
+
     _editorUpdatePlayheadUi();
     _editor.raf = requestAnimationFrame(() => { tick(); });
   };
 
+  // Play BGM and Voice tracks if enabled
+  const bgmAud = _getAudioElement('bgMusic');
+  const voiceAud = _getAudioElement('voiceTrack');
+  if (bgmAud) {
+    bgmAud.loop = true;
+    _safePlayAudio(bgmAud, _editor.playhead);
+  }
+  if (voiceAud) {
+    voiceAud.loop = false;
+    _safePlayAudio(voiceAud, _editor.playhead);
+  }
+
+  // Play from current playhead position
   const first = _editorSegAt(_editor.playhead) || segs[0];
   video.dataset.clipUrl = first.url;
   video.src = first.url;
@@ -1431,11 +1951,20 @@ function _editorStop() {
   _editor.playing = false;
   if (_editor.raf) { cancelAnimationFrame(_editor.raf); _editor.raf = null; }
   try { _editor.video?.pause(); } catch (_) {}
+
+  // Pause BGM and Voice tracks
+  if (_editor.bgMusicElement) {
+    try { _editor.bgMusicElement.pause(); } catch (_) {}
+  }
+  if (_editor.voiceTrackElement) {
+    try { _editor.voiceTrackElement.pause(); } catch (_) {}
+  }
+
   const btn = document.getElementById('ed-play');
   if (btn) {
-    btn.textContent = '▶ Play all';
-    btn.classList.remove('btn-danger');
-    btn.classList.add('btn-primary');
+    btn.classList.remove('is-playing');
+    btn.title = 'Play from here (Space)';
+    btn.innerHTML = '<svg viewBox="0 0 24 24" fill="currentColor" width="18" height="18"><path d="M8 5v14l11-7z"/></svg>';
   }
   _editorUpdatePlayheadUi();
 }

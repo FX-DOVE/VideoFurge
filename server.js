@@ -469,6 +469,183 @@ app.put('/api/jobs/:id/editor', (req, res, next) => {
   }
 });
 
+// POST /api/jobs/:id/editor/audio — upload audio track (BGM or voiceTrack)
+const audioUpload = multer().single('audioTrack');
+app.post('/api/jobs/:id/editor/audio', (req, res, next) => {
+  audioUpload(req, res, (err) => {
+    if (err) return next(err);
+    try {
+      const job = readJob(req.params.id);
+      if (!job) return res.status(404).json({ error: 'not found' });
+      if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+
+      const trackType = req.body.trackType || 'bgMusic'; // 'bgMusic' or 'voiceTrack'
+      const ext = path.extname(req.file.originalname) || '.mp3';
+      const targetName = `editor_${trackType}${ext}`;
+      const dir = jobDir(job.id);
+      const destPath = path.join(dir, 'output', targetName);
+      
+      fs.mkdirSync(path.join(dir, 'output'), { recursive: true });
+      fs.writeFileSync(destPath, req.file.buffer);
+
+      const previewUrl = `/api/jobs/${job.id}/preview/audio/${trackType}${ext}`;
+      res.json({
+        ok: true,
+        url: previewUrl,
+        path: destPath,
+      });
+    } catch (e) {
+      next(e);
+    }
+  });
+});
+
+// GET /api/jobs/:id/preview/audio/:type — serve uploaded audio
+app.get('/api/jobs/:id/preview/audio/:type', (req, res, next) => {
+  try {
+    const job = readJob(req.params.id);
+    if (!job) return res.status(404).json({ error: 'not found' });
+    
+    const type = req.params.type;
+    const file = path.resolve(path.join(jobDir(job.id), 'output', `editor_${type}`));
+    if (!fs.existsSync(file)) return res.status(404).json({ error: 'audio not found' });
+
+    res.sendFile(file, (err) => {
+      if (err && !res.headersSent) next(err);
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// GET /api/jobs/:id/preview/frame/:index — serve static frame image for timeline thumbnail
+app.get('/api/jobs/:id/preview/frame/:index', (req, res, next) => {
+  try {
+    const job = readJob(req.params.id);
+    if (!job || job.status !== 'done') return res.status(404).json({ error: 'not ready' });
+
+    const idx = parseInt(req.params.index, 10);
+    if (!Number.isInteger(idx) || idx < 0 || idx > 9999) {
+      return res.status(400).json({ error: 'invalid frame index' });
+    }
+
+    const file = path.resolve(
+      path.join(jobDir(job.id), 'output', 'images', `frame_${String(idx).padStart(4, '0')}.png`)
+    );
+    if (!fs.existsSync(file)) return res.status(404).json({ error: 'frame not found' });
+
+    res.setHeader('Content-Type', 'image/png');
+    res.setHeader('Cache-Control', 'private, max-age=3600');
+    res.sendFile(file, (err) => {
+      if (err && !res.headersSent) next(err);
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /api/jobs/:id/editor/import — upload and transcode image/video clip on the fly
+const importUpload = multer().single('importFile');
+app.post('/api/jobs/:id/editor/import', (req, res, next) => {
+  importUpload(req, res, async (err) => {
+    if (err) return next(err);
+    try {
+      const job = readJob(req.params.id);
+      if (!job) return res.status(404).json({ error: 'not found' });
+      if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+
+      const originalName = req.file.originalname || 'imported_file';
+      const isImg = /\.(png|jpg|jpeg|webp|gif)$/i.test(originalName);
+      const isVid = /\.(mp4|mov|mkv|webm|avi)$/i.test(originalName);
+
+      if (!isImg && !isVid) {
+        return res.status(400).json({ error: 'Only images (png/jpg/webp/gif) or videos (mp4/mov/mkv/webm) can be imported' });
+      }
+
+      const { listJobClips } = require('./lib/editorRender');
+      const dir = jobDir(job.id);
+      const clips = listJobClips(dir, job);
+      const nextIdx = clips.length;
+      const padIdx = String(nextIdx).padStart(4, '0');
+
+      const tempInputPath = path.join(dir, 'output', `temp_import_${Date.now()}${path.extname(originalName)}`);
+      fs.writeFileSync(tempInputPath, req.file.buffer);
+
+      const destClipPath = path.join(dir, 'output', 'videoclips', `clip_${padIdx}.mp4`);
+      const destFramePath = path.join(dir, 'output', 'images', `frame_${padIdx}.png`);
+
+      fs.mkdirSync(path.join(dir, 'output', 'videoclips'), { recursive: true });
+      fs.mkdirSync(path.join(dir, 'output', 'images'), { recursive: true });
+
+      const { exec } = require('child_process');
+      const execPromise = (cmd) => new Promise((resolve, reject) => {
+        exec(cmd, (error, stdout, stderr) => {
+          if (error) reject(new Error(stderr || error.message));
+          else resolve(stdout);
+        });
+      });
+
+      if (isImg) {
+        const transcodeCmd = `ffmpeg -loop 1 -i "${tempInputPath}" -f lavfi -i anullsrc=r=44100:cl=stereo -c:v libx264 -t 5 -pix_fmt yuv420p -vf "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:black" -r 24 -c:a aac -shortest -y "${destClipPath}"`;
+        await execPromise(transcodeCmd);
+        fs.copyFileSync(tempInputPath, destFramePath);
+      } else {
+        const transcodeCmd = `ffmpeg -i "${tempInputPath}" -c:v libx264 -pix_fmt yuv420p -vf "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:black" -r 24 -c:a aac -ar 48000 -y "${destClipPath}"`;
+        await execPromise(transcodeCmd);
+        const frameCmd = `ffmpeg -i "${destClipPath}" -vframes 1 -q:v 2 -y "${destFramePath}"`;
+        await execPromise(frameCmd);
+      }
+
+      try { fs.unlinkSync(tempInputPath); } catch (_) {}
+
+      const freshClips = listJobClips(dir, job);
+      const newClipMeta = freshClips.find(c => c.index === nextIdx);
+      if (!newClipMeta) {
+        throw new Error('Failed to find the newly imported clip metadata');
+      }
+
+      const { defaultTimeline } = require('./lib/editorRender');
+      let timeline = job.editTimeline;
+      if (!timeline || !Array.isArray(timeline.clips) || timeline.clips.length === 0) {
+        timeline = defaultTimeline(clips);
+      }
+
+      timeline.clips.push({
+        id: `c${nextIdx}-${nextIdx}`,
+        sourceIndex: nextIdx,
+        enabled: true,
+        trimStart: 0,
+        trimEnd: Number(newClipMeta.duration.toFixed(3)),
+        speed: 1,
+        transition: timeline.defaultTransition || 'fade',
+        transitionDuration: 0.35,
+      });
+
+      updateJob(job.id, { editTimeline: timeline });
+
+      const sourceClips = freshClips.map(c => ({
+        index: c.index,
+        name: c.name,
+        duration: c.duration,
+        text: c.text,
+        startMs: c.startMs,
+        endMs: c.endMs,
+        url: `/api/jobs/${job.id}/preview/clip/${c.index}`,
+      }));
+
+      res.json({
+        ok: true,
+        clips: sourceClips,
+        timeline,
+      });
+    } catch (e) {
+      console.error(e);
+      res.status(500).json({ error: `Import failed: ${e.message}` });
+    }
+  });
+});
+
+
 // POST /api/jobs/:id/editor/render — queue server-side re-render (works offline after)
 app.post('/api/jobs/:id/editor/render', (req, res, next) => {
   try {
