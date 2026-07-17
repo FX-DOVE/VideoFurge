@@ -19,9 +19,18 @@ const { getMode, normalizeModeId, hasFixedRuntime } = require('./lib/videoModes'
 const { normalizeAspectKey, resolveAspect } = require('./lib/aspect');
 const { generateScript } = require('./lib/scriptGenerator');
 const { getStorage } = require('./services/storage');
+const { startGrokSessionCleanupScheduler } = require('./lib/grokSessionCleanup');
 
 const POLL_INTERVAL_MS = 5000;
 console.log("worker is running");
+
+// Background maintenance: delete Grok CLI session dirs older than GROK_SESSION_RETENTION_DAYS (default 2).
+// Only touches ~/.grok/sessions/* (or GROK_SESSIONS_DIR); never deletes ~/.grok itself.
+try {
+  startGrokSessionCleanupScheduler();
+} catch (err) {
+  console.error('[worker] grok session cleanup scheduler failed to start (non-fatal):', err && err.message || err);
+}
 
 function logForJob(jobId, msg, extra) {
   const line = `[${new Date().toISOString()}] [${jobId}] ${msg}${extra ? ' ' + JSON.stringify(extra) : ''}\n`;

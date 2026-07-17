@@ -39,6 +39,9 @@ See `.env.example`. Important ones:
 - `API_KEYS` (comma list — clients must send `X-API-Key`)
 - `MAX_JOBS_PER_DAY`, `MAX_DISK_BYTES`, `JOB_TTL_HOURS`
 - `PORT`
+- **Grok session cleanup (worker):** `GROK_SESSION_RETENTION_DAYS` (default **2** = 48 hours).
+  Periodically deletes old folders under `~/.grok/sessions` (VPS root: `/root/.grok/sessions`).
+  Does **not** delete `~/.grok` itself. Override path with `GROK_SESSIONS_DIR`.
 - **Optional durable storage:** see `.env.example`. When enabled, the worker uploads
   **all job outputs** to Drive + MongoDB, then deletes local copies after verify.
   **Personal Gmail:** service accounts cannot store files in My Drive — set
