@@ -39,6 +39,12 @@ See `.env.example`. Important ones:
 - `API_KEYS` (comma list — clients must send `X-API-Key`)
 - `MAX_JOBS_PER_DAY`, `MAX_DISK_BYTES`, `JOB_TTL_HOURS`
 - `PORT`
+- **Optional durable storage:** see `.env.example`. When enabled, the worker uploads
+  **all job outputs** to Drive + MongoDB, then deletes local copies after verify.
+  **Personal Gmail:** service accounts cannot store files in My Drive — set
+  `GOOGLE_DRIVE_AUTH_MODE=oauth`, create an OAuth Desktop client, run `npm run drive:oauth`
+  once, then restart server/worker. **Workspace Shared drives** can use a service account.
+  Leave `GOOGLE_DRIVE_ENABLED=false` for local-only.
 
 ## Running
 

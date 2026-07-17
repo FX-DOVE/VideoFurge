@@ -18,6 +18,7 @@ const {
 } = require('./lib/jobStore');
 const { listModes, normalizeModeId, getMode, isMediaRequired, hasFixedRuntime } = require('./lib/videoModes');
 const { normalizeAspectKey, ASPECT_PRESETS } = require('./lib/aspect');
+const { getStorage } = require('./services/storage');
 
 const app        = express();
 const httpServer = createServer(app);
@@ -126,11 +127,20 @@ function checkDailyRate(apiKey) {
 // SECURITY NOTE: exposes one API key to any client that can reach the server.
 // Replace with a proper login endpoint when you add real user auth.
 app.get('/api/config', (req, res) => {
+  let storageSummary = { enabled: false, configured: false };
+  try {
+    storageSummary = getStorage().getConfigSummary();
+  } catch (_) {}
   res.json({
     apiKey: API_KEYS[0] || 'dev',
     dev:    API_KEYS.length === 0,
     videoTypes: listModes(),
     aspectRatios: Object.entries(ASPECT_PRESETS).map(([id, v]) => ({ id, label: v.label, w: v.w, h: v.h })),
+    storage: {
+      enabled: !!storageSummary.enabled,
+      configured: !!storageSummary.configured,
+      provider: storageSummary.configured ? 'google_drive' : 'local',
+    },
   });
 });
 
@@ -151,8 +161,9 @@ function clampInt(v, lo, hi) {
 }
 
 
-// Which output files exist (so the UI only shows working players / download links).
-function getJobAssets(job) {
+// Which outputs are ready: local files and/or verified Drive+Mongo assets.
+// Sync path used when async Mongo is unavailable; dual-read via storage service.
+function getJobAssetsLocal(job) {
   if (!job || job.status !== 'done') return null;
   const out = path.join(jobDir(job.id), 'output');
   const exists = (name) => {
@@ -163,7 +174,7 @@ function getJobAssets(job) {
       return false;
     }
   };
-  return {
+  const base = {
     video:  exists('final.mp4'),
     acted:  exists('acted.mp4'),
     concat: exists('concat-video.mp4'),
@@ -172,10 +183,38 @@ function getJobAssets(job) {
       || fs.existsSync(path.join(out, 'images'))
       || fs.existsSync(path.join(out, 'videoclips')),
   };
+  // Merge storage summary from job.json (written by worker after handoff)
+  if (job.storage && job.storage.assets) {
+    const sa = job.storage.assets;
+    if (sa.final && sa.final.ok && sa.final.driveFileId) base.video = true;
+    if (sa.acted && sa.acted.ok && sa.acted.driveFileId) base.acted = true;
+    if (sa.edited && sa.edited.ok && sa.edited.driveFileId) base.edited = true;
+    if (sa.concat && sa.concat.ok && sa.concat.driveFileId) base.concat = true;
+    if (sa.images && sa.images.ok && sa.images.driveFileId) base.images = true;
+  }
+  return base;
+}
+
+function getJobAssets(job) {
+  return getJobAssetsLocal(job);
+}
+
+/** Async dual-read for detail responses when Drive is enabled. */
+async function getJobAssetsAsync(job) {
+  if (!job || job.status !== 'done') return null;
+  try {
+    const storage = getStorage();
+    if (storage.isEnabled()) {
+      return await storage.getJobAssets(job, jobDir(job.id));
+    }
+  } catch (err) {
+    console.error('[storage] getJobAssets failed:', err.message);
+  }
+  return getJobAssetsLocal(job);
 }
 
 // Strip filesystem paths and heavy computed fields before sending to clients.
-function stripSafe(job) {
+function stripSafe(job, assetsOverride = null) {
   if (!job) return null;
   const {
     mediaPath, referenceImagePaths, segments, beats, styleSummary, apiKey, script,
@@ -189,7 +228,18 @@ function stripSafe(job) {
       gender: c.gender || 'unspecified',
     }));
   }
-  rest.assets = getJobAssets(job);
+  rest.assets = assetsOverride || getJobAssets(job);
+
+  // Additive storage summary (no secrets)
+  if (job.storage) {
+    rest.storage = {
+      provider: job.storage.provider || null,
+      enabled: job.storage.enabled !== false,
+      complete: !!job.storage.complete,
+      error: job.storage.error || null,
+      completedAt: job.storage.completedAt || null,
+    };
+  }
 
   // Expose lightweight edit-render status (no full timeline dump on every poll)
   if (job.editRender) {
@@ -205,6 +255,25 @@ function stripSafe(job) {
     delete rest.editRender;
   }
   return rest;
+}
+
+/** Primary video payload for clients (additive, Drive-aware). */
+function videoPayloadFromAssets(job, assets) {
+  if (!job || !assets) return null;
+  const f = assets.files && assets.files.final;
+  const ready = !!(assets.video || (f && f.ready));
+  if (!ready && job.status !== 'done') return null;
+  return {
+    id: job.id,
+    status: job.storage && job.storage.complete ? 'completed'
+      : (job.storage && job.storage.error ? 'storage_failed' : (ready ? 'completed' : job.status)),
+    driveFileId: (f && f.driveFileId) || (job.storage && job.storage.assets && job.storage.assets.final && job.storage.assets.final.driveFileId) || null,
+    viewUrl: (f && (f.viewUrl || f.driveViewUrl)) || null,
+    downloadUrl: `/api/jobs/${job.id}/download/video`,
+    size: (f && f.size) || null,
+    duration: (f && f.duration) || null,
+    createdAt: job.createdAt || null,
+  };
 }
 
 // Compact summary for the list view.
@@ -462,15 +531,18 @@ app.get('/api/jobs', (req, res, next) => {
 });
 
 // GET /api/jobs/:id — job detail
-app.get('/api/jobs/:id', (req, res, next) => {
+app.get('/api/jobs/:id', async (req, res, next) => {
   try {
     const job = readJob(req.params.id);
     if (!job) return res.status(404).json({ error: 'not found' });
-    const safe = stripSafe(job);
+    const assets = await getJobAssetsAsync(job);
+    const safe = stripSafe(job, assets);
     if (!safe) return res.status(404).json({ error: 'not found' });
     safe.styleRefCount = Array.isArray(job.styleReferencePaths) ? job.styleReferencePaths.length : 0;
     // Keep heavy fields the UI may still show (script is stripped for size)
     safe.totalDurationMs = job.totalDurationMs || null;
+    safe.success = job.status === 'done';
+    safe.video = videoPayloadFromAssets(job, assets || getJobAssetsLocal(job));
     res.json(safe);
   } catch (err) {
     next(err);
@@ -621,8 +693,8 @@ app.get('/api/jobs/:id/preview/audio/:type', (req, res, next) => {
   }
 });
 
-// GET /api/jobs/:id/preview/frame/:index — serve static frame image for timeline thumbnail
-app.get('/api/jobs/:id/preview/frame/:index', (req, res, next) => {
+// GET /api/jobs/:id/preview/frame/:index — timeline thumbnail (local or Drive)
+app.get('/api/jobs/:id/preview/frame/:index', async (req, res, next) => {
   try {
     const job = readJob(req.params.id);
     if (!job || job.status !== 'done') return res.status(404).json({ error: 'not ready' });
@@ -632,16 +704,40 @@ app.get('/api/jobs/:id/preview/frame/:index', (req, res, next) => {
       return res.status(400).json({ error: 'invalid frame index' });
     }
 
+    const pad = String(idx).padStart(4, '0');
     const file = path.resolve(
-      path.join(jobDir(job.id), 'output', 'images', `frame_${String(idx).padStart(4, '0')}.png`)
+      path.join(jobDir(job.id), 'output', 'images', `frame_${pad}.png`)
     );
-    if (!fs.existsSync(file)) return res.status(404).json({ error: 'frame not found' });
+    if (fs.existsSync(file) && fs.statSync(file).size > 0) {
+      res.setHeader('Content-Type', 'image/png');
+      res.setHeader('Cache-Control', 'private, max-age=3600');
+      return res.sendFile(file, (err) => {
+        if (err && !res.headersSent) next(err);
+      });
+    }
 
-    res.setHeader('Content-Type', 'image/png');
-    res.setHeader('Cache-Control', 'private, max-age=3600');
-    res.sendFile(file, (err) => {
-      if (err && !res.headersSent) next(err);
-    });
+    try {
+      const storage = getStorage();
+      if (storage.isEnabled() && typeof storage.openReadByAssetKey === 'function') {
+        const opened = await storage.openReadByAssetKey(job.id, jobDir(job.id), `frame_${pad}`);
+        if (opened.source === 'local' && opened.path) {
+          res.setHeader('Content-Type', opened.mimeType || 'image/png');
+          return res.sendFile(path.resolve(opened.path), (err) => {
+            if (err && !res.headersSent) next(err);
+          });
+        }
+        if (opened.source === 'drive' && opened.stream) {
+          res.setHeader('Content-Type', opened.mimeType || 'image/png');
+          if (opened.size) res.setHeader('Content-Length', String(opened.size));
+          opened.stream.on('error', () => { if (!res.headersSent) res.status(502).end(); else res.end(); });
+          return opened.stream.pipe(res);
+        }
+      }
+    } catch (e) {
+      if (e.status !== 404) console.error('[storage] frame preview:', e.message);
+    }
+
+    return res.status(404).json({ error: 'frame not found' });
   } catch (err) {
     next(err);
   }
@@ -860,7 +956,7 @@ app.get('/api/jobs/:id/download/:asset', async (req, res, next) => {
     let file = targets[req.params.asset];
     if (!file) return res.status(404).json({ error: 'asset not found' });
 
-    // If it's the images/assets zip and it's missing, generate it on the fly
+    // If it's the images/assets zip and it's missing, generate it on the fly (local only)
     if (req.params.asset === 'images' && !fs.existsSync(file)) {
       console.log(`[server] images.zip missing for job ${job.id}, generating on the fly...`);
       try {
@@ -886,24 +982,53 @@ app.get('/api/jobs/:id/download/:asset', async (req, res, next) => {
             });
             proc.on('error', reject);
           });
-        } else {
-          return res.status(404).json({ error: 'no images or clips found to zip' });
         }
       } catch (zipErr) {
         console.error(`[server] failed to generate zip on the fly:`, zipErr);
-        return res.status(500).json({ error: `failed to build zip archive: ${zipErr.message}` });
       }
     }
 
-    if (!fs.existsSync(file)) return res.status(404).json({ error: 'asset not found' });
-    res.download(file, (err) => { if (err && !res.headersSent) next(err); });
+    // Local first
+    if (fs.existsSync(file) && fs.statSync(file).size > 0) {
+      return res.download(file, (err) => { if (err && !res.headersSent) next(err); });
+    }
+
+    // Drive fallback via storage facade (stream — no full file in RAM)
+    try {
+      const storage = getStorage();
+      const opened = await storage.openRead(job.id, jobDir(job.id), req.params.asset);
+      if (opened.source === 'local' && opened.path) {
+        return res.download(opened.path, (err) => { if (err && !res.headersSent) next(err); });
+      }
+      if (opened.source === 'drive' && opened.stream) {
+        res.setHeader('Content-Type', opened.mimeType || 'application/octet-stream');
+        res.setHeader(
+          'Content-Disposition',
+          `attachment; filename="${(opened.filename || 'video.mp4').replace(/"/g, '')}"`
+        );
+        if (opened.size) res.setHeader('Content-Length', String(opened.size));
+        opened.stream.on('error', (err) => {
+          console.error('[storage] download stream error:', err.message);
+          if (!res.headersSent) res.status(502).json({ error: 'drive stream failed' });
+          else res.end();
+        });
+        return opened.stream.pipe(res);
+      }
+    } catch (driveErr) {
+      if (driveErr.status !== 404) {
+        console.error('[storage] download fallback:', driveErr.message);
+      }
+    }
+
+    return res.status(404).json({ error: 'asset not found' });
   } catch (err) {
     next(err);
   }
 });
 
 // GET /api/jobs/:id/preview/clip/:index — stream a single source clip for the editor
-app.get('/api/jobs/:id/preview/clip/:index', (req, res, next) => {
+// Local first; falls back to Drive (clip_XXXX asset) after storage handoff.
+app.get('/api/jobs/:id/preview/clip/:index', async (req, res, next) => {
   try {
     const job = readJob(req.params.id);
     if (!job || job.status !== 'done') return res.status(404).json({ error: 'not ready' });
@@ -913,56 +1038,103 @@ app.get('/api/jobs/:id/preview/clip/:index', (req, res, next) => {
       return res.status(400).json({ error: 'invalid clip index' });
     }
 
+    const pad = String(idx).padStart(4, '0');
     const file = path.resolve(
-      path.join(jobDir(job.id), 'output', 'videoclips', `clip_${String(idx).padStart(4, '0')}.mp4`)
+      path.join(jobDir(job.id), 'output', 'videoclips', `clip_${pad}.mp4`)
     );
-    if (!fs.existsSync(file)) return res.status(404).json({ error: 'clip not found' });
+    if (fs.existsSync(file) && fs.statSync(file).size > 0) {
+      res.setHeader('Content-Type', 'video/mp4');
+      res.setHeader('Accept-Ranges', 'bytes');
+      res.setHeader('Cache-Control', 'private, max-age=3600');
+      return res.sendFile(file, {
+        acceptRanges: true,
+        headers: { 'Content-Type': 'video/mp4' },
+      }, (err) => {
+        if (err && !res.headersSent) next(err);
+      });
+    }
 
-    res.setHeader('Content-Type', 'video/mp4');
-    res.setHeader('Accept-Ranges', 'bytes');
-    res.setHeader('Cache-Control', 'private, max-age=3600');
-    res.sendFile(file, {
-      acceptRanges: true,
-      headers: { 'Content-Type': 'video/mp4' },
-    }, (err) => {
-      if (err && !res.headersSent) next(err);
-    });
+    try {
+      const storage = getStorage();
+      if (storage.isEnabled() && typeof storage.openReadByAssetKey === 'function') {
+        const opened = await storage.openReadByAssetKey(job.id, jobDir(job.id), `clip_${pad}`);
+        if (opened.source === 'local' && opened.path) {
+          return res.sendFile(path.resolve(opened.path), (err) => {
+            if (err && !res.headersSent) next(err);
+          });
+        }
+        if (opened.source === 'drive' && opened.stream) {
+          res.setHeader('Content-Type', opened.mimeType || 'video/mp4');
+          if (opened.size) res.setHeader('Content-Length', String(opened.size));
+          opened.stream.on('error', () => { if (!res.headersSent) res.status(502).end(); else res.end(); });
+          return opened.stream.pipe(res);
+        }
+      }
+    } catch (e) {
+      if (e.status !== 404) console.error('[storage] clip preview:', e.message);
+    }
+
+    return res.status(404).json({ error: 'clip not found' });
   } catch (err) {
     next(err);
   }
 });
 
 // GET /api/jobs/:id/preview/:asset — inline video stream for <video src>.
-// Uses res.sendFile so browsers can play inline and range-request for scrubbing.
+// Local sendFile when present; otherwise stream from Google Drive via storage facade.
 // Auth: also accepts ?k= query param because <video> cannot send custom headers.
-app.get('/api/jobs/:id/preview/:asset', (req, res, next) => {
+app.get('/api/jobs/:id/preview/:asset', async (req, res, next) => {
   try {
     const job = readJob(req.params.id);
     if (!job || job.status !== 'done') return res.status(404).json({ error: 'not ready' });
-    
+
     let filename;
     if (req.params.asset === 'video') filename = 'final.mp4';
     else if (req.params.asset === 'acted') filename = 'acted.mp4';
     else if (req.params.asset === 'edited') filename = 'edited.mp4';
+    else if (req.params.asset === 'concat') filename = 'concat-video.mp4';
     else return res.status(404).json({ error: 'asset not found' });
 
     const file = path.resolve(path.join(jobDir(job.id), 'output', filename));
-    if (!fs.existsSync(file)) return res.status(404).json({ error: 'asset not found' });
+    if (fs.existsSync(file) && fs.statSync(file).size > 0) {
+      res.setHeader('Content-Type', 'video/mp4');
+      res.setHeader('Accept-Ranges', 'bytes');
+      res.setHeader('Cache-Control', 'private, max-age=0, must-revalidate');
+      return res.sendFile(file, {
+        acceptRanges: true,
+        headers: { 'Content-Type': 'video/mp4' },
+      }, (err) => {
+        if (err && !res.headersSent) next(err);
+      });
+    }
 
-    // Explicit media headers help browsers (and reverse proxies) treat this as
-    // a seekable video stream rather than a generic download.
-    res.setHeader('Content-Type', 'video/mp4');
-    res.setHeader('Accept-Ranges', 'bytes');
-    res.setHeader('Cache-Control', 'private, max-age=0, must-revalidate');
-    res.sendFile(file, {
-      acceptRanges: true,
-      // Do not force download; <video> needs inline playback
-      headers: {
-        'Content-Type': 'video/mp4',
-      },
-    }, (err) => {
-      if (err && !res.headersSent) next(err);
-    });
+    // Drive stream fallback (range requests limited vs sendFile — still playable)
+    try {
+      const storage = getStorage();
+      const opened = await storage.openRead(job.id, jobDir(job.id), req.params.asset);
+      if (opened.source === 'local' && opened.path) {
+        res.setHeader('Content-Type', 'video/mp4');
+        res.setHeader('Accept-Ranges', 'bytes');
+        return res.sendFile(path.resolve(opened.path), (err) => {
+          if (err && !res.headersSent) next(err);
+        });
+      }
+      if (opened.source === 'drive' && opened.stream) {
+        res.setHeader('Content-Type', opened.mimeType || 'video/mp4');
+        res.setHeader('Cache-Control', 'private, max-age=0, must-revalidate');
+        if (opened.size) res.setHeader('Content-Length', String(opened.size));
+        opened.stream.on('error', (err) => {
+          console.error('[storage] preview stream error:', err.message);
+          if (!res.headersSent) res.status(502).end();
+          else res.end();
+        });
+        return opened.stream.pipe(res);
+      }
+    } catch (e) {
+      if (e.status !== 404) console.error('[storage] preview fallback:', e.message);
+    }
+
+    return res.status(404).json({ error: 'asset not found' });
   } catch (err) {
     next(err);
   }
@@ -995,10 +1167,20 @@ app.post('/api/jobs/:id/retry', (req, res, next) => {
   }
 });
 
-// DELETE /api/jobs/:id — wipes all files for a job
-app.delete('/api/jobs/:id', (req, res, next) => {
+// DELETE /api/jobs/:id — wipes Drive/Mongo assets (if enabled) then local job tree
+app.delete('/api/jobs/:id', async (req, res, next) => {
   try {
-    deleteJob(req.params.id);
+    const id = req.params.id;
+    try {
+      const storage = getStorage();
+      if (storage.isEnabled()) {
+        await storage.deleteJobStorage(id);
+      }
+    } catch (err) {
+      console.error('[storage] deleteJobStorage failed:', err.message);
+      // Continue with local delete so the job disappears from UI
+    }
+    deleteJob(id);
     _storageCache.ts = 0; // force fresh scan
     res.status(204).end();
   } catch (err) {

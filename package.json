@@ -3,25 +3,37 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev":          "nodemon server.js",
-    "dev:worker":   "nodemon worker.js",
-    "server":       "node server.js",
-    "worker":       "node worker.js",
-    "test:grok":    "node test-grok-image.js",
-    "test:stitch":  "node test-stitch-long.js"
+    "dev": "nodemon server.js",
+    "dev:worker": "nodemon worker.js",
+    "server": "node server.js",
+    "worker": "node worker.js",
+    "test:grok": "node test-grok-image.js",
+    "test:stitch": "node test-stitch-long.js",
+    "drive:oauth": "node scripts/google-drive-oauth-setup.js"
   },
   "nodemonConfig": {
-    "watch": ["server.js", "worker.js", "lib/", "frontend/"],
-    "ignore": ["jobs/", "node_modules/"],
-    "ext":    "js,json,html,css",
-    "delay":  "500"
+    "watch": [
+      "server.js",
+      "worker.js",
+      "lib/",
+      "services/",
+      "frontend/"
+    ],
+    "ignore": [
+      "jobs/",
+      "node_modules/"
+    ],
+    "ext": "js,json,html,css",
+    "delay": "500"
   },
   "dependencies": {
-    "dotenv":    "^16.4.5",
-    "express":   "^4.19.2",
-    "multer":    "^1.4.5-lts.1",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "googleapis": "^173.0.0",
+    "mongodb": "^7.5.0",
+    "multer": "^1.4.5-lts.1",
     "socket.io": "^4.7.5",
-    "uuid":      "^9.0.1"
+    "uuid": "^9.0.1"
   },
   "devDependencies": {
     "nodemon": "^3.1.4"

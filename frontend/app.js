@@ -11,13 +11,14 @@ const STATUS_LABELS = {
   generating:       'Generating',
   mixing_audio:     'Mixing Audio',
   stitching:        'Stitching',
+  uploading:        'Uploading to cloud',
   done:             'Done',
   failed:           'Failed',
   // edit render statuses (nested under job.editRender)
   rendering:        'Rendering edit',
 };
 
-const STATUS_STEPS = ['queued', 'processing', 'transcribing', 'building_prompts', 'generating', 'mixing_audio', 'stitching', 'done'];
+const STATUS_STEPS = ['queued', 'processing', 'transcribing', 'building_prompts', 'generating', 'mixing_audio', 'stitching', 'uploading', 'done'];
 
 const STATUS_BADGE_CLASS = {
   queued:           'badge-queued',
@@ -27,6 +28,7 @@ const STATUS_BADGE_CLASS = {
   generating:       'badge-generating',
   mixing_audio:     'badge-mixing',
   stitching:        'badge-stitching',
+  uploading:        'badge-mixing',
   done:             'badge-done',
   failed:           'badge-failed',
 };

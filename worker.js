@@ -18,6 +18,7 @@ const { renderEditedVideo } = require('./lib/editorRender');
 const { getMode, normalizeModeId, hasFixedRuntime } = require('./lib/videoModes');
 const { normalizeAspectKey, resolveAspect } = require('./lib/aspect');
 const { generateScript } = require('./lib/scriptGenerator');
+const { getStorage } = require('./services/storage');
 
 const POLL_INTERVAL_MS = 5000;
 console.log("worker is running");
@@ -31,6 +32,56 @@ function logForJob(jobId, msg, extra) {
     const logPath = path.join(jobDir(jobId), 'job.log');
     fs.appendFileSync(logPath, line);
   } catch (_) { }
+}
+
+function appendJobLog(jobId, line) {
+  try {
+    fs.appendFileSync(path.join(jobDir(jobId), 'job.log'), line);
+  } catch (_) {}
+}
+
+/**
+ * Durable storage handoff (Drive + Mongo). No-op when GOOGLE_DRIVE_ENABLED is false.
+ * Never throws out of processJob — failures keep local files and record storage.error.
+ */
+async function runStorageHandoff(job, { stage }) {
+  const storage = getStorage();
+  const dir = jobDir(job.id);
+  try {
+    const result = await storage.finalizeJobOutputs(job, dir, {
+      stage,
+      appendJobLog,
+    });
+    if (result && result.storage) {
+      updateJob(job.id, { storage: result.storage });
+    }
+    logForJob(job.id, 'storage handoff', {
+      stage,
+      enabled: result.enabled,
+      complete: result.complete,
+      results: (result.results || []).map(r => ({
+        assetKey: r.assetKey,
+        ok: r.ok,
+        skipped: r.skipped,
+        error: r.error || null,
+      })),
+    });
+    return result;
+  } catch (err) {
+    logForJob(job.id, 'storage handoff FAILED', { stage, error: String(err && err.message || err) });
+    try {
+      updateJob(job.id, {
+        storage: {
+          provider: 'google_drive',
+          enabled: storage.isEnabled(),
+          complete: false,
+          error: String(err && err.message || err),
+          completedAt: new Date().toISOString(),
+        },
+      });
+    } catch (_) {}
+    return { enabled: storage.isEnabled(), complete: false, error: String(err && err.message || err) };
+  }
 }
 
 function getClipDuration(filePath) {
@@ -87,6 +138,13 @@ function recoverInterruptedJobs() {
 
     if (['queued', 'done', 'failed'].includes(s)) continue;
 
+    // Interrupted during Drive handoff — re-queue; local files still present for retry
+    if (s === 'uploading') {
+      updateJob(id, { status: 'queued', error: null, recovery: 'auto-recovered from uploading (storage handoff)' });
+      console.log(`[recover] queued ${id} (was uploading) for storage/finalize retry`);
+      continue;
+    }
+
     // Re-queue interrupted jobs (including claim-only "processing") so any available
     // worker can pick them up. processJob() resume logic skips completed stages.
     if (s === 'generating') {
@@ -125,6 +183,10 @@ async function processEditRender(job) {
         } catch (_) {}
       },
     });
+
+    // Upload edited.mp4 to Drive + Mongo, then delete local when confirmed
+    const fresh = readJob(job.id) || job;
+    await runStorageHandoff(fresh, { stage: 'edit' });
 
     const cur = readJob(job.id);
     const totalClips = cur?.editRender?.progress?.total
@@ -170,6 +232,21 @@ async function processJob(job) {
 
   try {
     logForJob(job.id, 'process start', { status: job.status, progress: p });
+
+    // Fast path: re-queued after interrupted Drive handoff — stitch already done, finals on disk
+    const finalPath = path.join(dir, 'output', 'final.mp4');
+    const actedPath = path.join(dir, 'output', 'acted.mp4');
+    if (
+      job.recovery && /uploading|storage/i.test(String(job.recovery)) &&
+      (fs.existsSync(finalPath) || fs.existsSync(actedPath))
+    ) {
+      logForJob(job.id, 'storage-only recovery path');
+      updateJob(job.id, { status: 'uploading', recovery: null });
+      await runStorageHandoff(job, { stage: 'stitch' });
+      updateJob(job.id, { status: 'done', error: null });
+      logForJob(job.id, 'done (storage recovery)');
+      return;
+    }
 
     // Common inputs
     const characters = Array.isArray(job.characters) ? job.characters : [];
@@ -546,6 +623,12 @@ async function processJob(job) {
       resolution,
       captionsEnabled: (customOptions.captionsOn != null ? !!customOptions.captionsOn : mode.captions),
     });
+
+    // Durable storage: upload → verify → Mongo → delete local (or no-op if Drive disabled)
+    updateJob(job.id, { status: 'uploading' });
+    logForJob(job.id, 'storage handoff starting', { stage: 'stitch' });
+    const jobAfterStitch = readJob(job.id) || job;
+    await runStorageHandoff(jobAfterStitch, { stage: 'stitch' });
 
     updateJob(job.id, { status: 'done', error: null });
     logForJob(job.id, 'done');
