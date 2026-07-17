@@ -8,13 +8,16 @@ require('dotenv').config();
 const path = require('path');
 const { claimNextQueuedJob, claimNextEditRenderJob, updateJob, jobDir, readJob } = require('./lib/jobStore');
 const { transcribe } = require('./lib/transcribe');
-const { groupIntoBeats, buildPrompts, chunkIntoBatches, BEAT_SECONDS } = require('./lib/promptBuilder');
+const { groupIntoBeats, buildPrompts, chunkIntoBatches, segmentsFromScript, BEAT_SECONDS } = require('./lib/promptBuilder');
 const { getStyleSummary, runBatch } = require('./lib/grokBatch');
 const { runPreProduction } = require('./lib/preproduction');
 const { updateContinuity } = require('./lib/continuityUpdater');
 const { stitch } = require('./lib/stitch');
 const { mixAudio } = require('./lib/audioMix');
 const { renderEditedVideo } = require('./lib/editorRender');
+const { getMode, normalizeModeId, hasFixedRuntime } = require('./lib/videoModes');
+const { normalizeAspectKey, resolveAspect } = require('./lib/aspect');
+const { generateScript } = require('./lib/scriptGenerator');
 
 const POLL_INTERVAL_MS = 5000;
 console.log("worker is running");
@@ -84,9 +87,8 @@ function recoverInterruptedJobs() {
 
     if (['queued', 'done', 'failed'].includes(s)) continue;
 
-    // Re-queue interrupted jobs so any available worker can pick them up.
-    // The processJob() resume logic (based on persisted segments/beats/progress)
-    // will skip stages that are already complete on disk.
+    // Re-queue interrupted jobs (including claim-only "processing") so any available
+    // worker can pick them up. processJob() resume logic skips completed stages.
     if (s === 'generating') {
       const pd = j.progress || { batchesDone: 0, batchesTotal: 0 };
       const note = (pd.batchesDone || 0) < (pd.batchesTotal || 0)
@@ -169,29 +171,200 @@ async function processJob(job) {
   try {
     logForJob(job.id, 'process start', { status: job.status, progress: p });
 
-    // --- TRANSCRIBE (resume if already done) ---
-    if (job.segments && job.totalDurationMs && !['done', 'failed'].includes(job.status)) {
-      segments = job.segments;
-      totalDurationMs = job.totalDurationMs;
-      logForJob(job.id, 'resume from persisted segments');
-    } else {
-      updateJob(job.id, { status: 'transcribing' });
-      logForJob(job.id, 'transcribing');
-      segments = await transcribe(job.mediaPath, dir);
-      totalDurationMs = segments.at(-1)?.endMs || 0;
-      updateJob(job.id, { segments, totalDurationMs });
-    }
-
-    // --- PRE-PRODUCTION & SCREENPLAY (resume if already done) ---
+    // Common inputs
     const characters = Array.isArray(job.characters) ? job.characters : [];
     const sceneStyle = job.sceneStyle || '';
     const styleReferencePaths = Array.isArray(job.styleReferencePaths) ? job.styleReferencePaths : [];
 
-    updateJob(job.id, { status: 'building_prompts' });
-    logForJob(job.id, 'pre-production: screenplay & canonical refs');
-    
+    // Video type + aspect ratio (backward compatible defaults).
+    const videoType = normalizeModeId(job.videoType);
+    const mode = getMode(videoType);
+    const resolution = normalizeAspectKey(job.resolution || mode.defaultAspect);
+    const customOptions = (job.customOptions && typeof job.customOptions === 'object') ? job.customOptions : {};
+    job.videoType = videoType;
+    job.resolution = resolution;
+    job.customOptions = customOptions;
+    updateJob(job.id, { videoType, resolution, customOptions });
+
+    // Strict media check: only a real existing file counts. null/undefined/"" must NOT
+    // reach path.resolve / whisper (that throws: paths[0] must be of type string).
+    const mediaPath =
+      (typeof job.mediaPath === 'string' && job.mediaPath.trim()) ? job.mediaPath.trim() : null;
+    const hasMedia = !!(mediaPath && fs.existsSync(mediaPath));
+    if (job.mediaPath && !hasMedia) {
+      logForJob(job.id, 'mediaPath present but unusable — treating as no-media', {
+        mediaPath: job.mediaPath,
+      });
+    }
+
+    // Audio-first modes (documentary, explainer, commercial, music video) MUST have
+    // media so visuals are timed and matched to the real audio. Acted/dialogue-driven
+    // modes (drama, movie, cinematic_trailer, anime) may run from the script alone.
+    if (!hasMedia && mode.mediaRequired !== false) {
+      throw new Error(
+        `Video type "${mode.label}" is audio-first and requires a media file. ` +
+        `No media was provided. Re-create the job with an audio/video file, or choose an acted mode (Drama, Movie, Cinematic Trailer, Anime).`
+      );
+    }
+
+    // Exact runtime for Drama / Movie / Anime (and any fixedRuntime mode).
+    // User-chosen minutes MUST match final video length when there is no media.
+    const fixedRuntime = hasFixedRuntime(videoType) || !!mode.fixedRuntime;
+    const defaultMin = mode.defaultTargetMinutes || 3;
+    let targetMinutes = Number(customOptions.targetMinutes);
+    if (!Number.isFinite(targetMinutes) || targetMinutes < 1) {
+      targetMinutes = fixedRuntime ? defaultMin : null;
+    } else {
+      targetMinutes = Math.max(1, Math.min(30, Math.round(targetMinutes)));
+    }
+    const partNumber = Math.max(1, Math.min(50, Number(customOptions.partNumber) || 1));
+    if (fixedRuntime && targetMinutes) {
+      customOptions.targetMinutes = targetMinutes;
+      customOptions.partNumber = partNumber;
+      updateJob(job.id, { customOptions, targetMinutes, partNumber });
+      logForJob(job.id, 'fixed runtime', { targetMinutes, partNumber, videoType });
+    }
+
+    // Auto-generate a script ONLY when there is no media (acted modes running from
+    // script alone). With media, the audio transcription is the source of truth,
+    // so we never fabricate a competing script.
+    if (!hasMedia && mode.allowScriptGen && (!job.script || !job.script.trim()) && !job.scriptGenerated) {
+      try {
+        logForJob(job.id, 'generating script from title', {
+          videoType, hasMedia, targetMinutes, partNumber,
+        });
+        const gen = await generateScript(
+          {
+            title: job.title,
+            mode,
+            characters,
+            sceneStyle,
+            custom: { ...customOptions, targetMinutes, partNumber },
+          },
+          dir
+        );
+        if (gen) {
+          job.script = gen;
+          updateJob(job.id, { script: gen, scriptGenerated: true });
+          logForJob(job.id, 'script generated', { chars: gen.length, targetMinutes });
+        }
+      } catch (sgErr) {
+        logForJob(job.id, 'script generation WARN (non-fatal)', { error: String(sgErr && sgErr.message || sgErr) });
+      }
+    }
+
+    // --- SEGMENTS: transcribe media, or synthesize from the script ---
+    if (job.segments && job.totalDurationMs && !['done', 'failed'].includes(job.status)) {
+      segments = job.segments;
+      totalDurationMs = job.totalDurationMs;
+      logForJob(job.id, 'resume from persisted segments');
+    } else if (hasMedia) {
+      updateJob(job.id, { status: 'transcribing' });
+      logForJob(job.id, 'transcribing', { mediaPath });
+      segments = await transcribe(mediaPath, dir);
+      totalDurationMs = segments.at(-1)?.endMs || 0;
+      updateJob(job.id, { segments, totalDurationMs });
+    } else {
+      // No media (typical drama/movie/anime): timed segments from the script.
+      // When fixedRuntime is on, force EXACT targetMinutes and cliffhanger if needed.
+      updateJob(job.id, { status: 'building_prompts', mediaPath: null, noMedia: true });
+      logForJob(job.id, 'no media — building segments from script', {
+        videoType,
+        scriptChars: (job.script || '').length,
+        targetMinutes,
+        partNumber,
+        fixedRuntime,
+      });
+      const segOpts = fixedRuntime && targetMinutes
+        ? { targetMinutes, title: job.title, partNumber }
+        : (targetMinutes ? { targetMinutes, title: job.title, partNumber } : {});
+      segments = segmentsFromScript(job.script, segOpts);
+      if (!segments.length) {
+        throw new Error(
+          'No media file and no usable script — cannot build a video. ' +
+          'For Drama/Movie/Anime provide a title (AI writes a script) or paste a script. ' +
+          'Or attach an audio/video file.'
+        );
+      }
+      totalDurationMs = segments.totalDurationMs || segments.at(-1)?.endMs || 0;
+      // Absolute snap to exact minutes for fixed-runtime modes
+      if (fixedRuntime && targetMinutes) {
+        const exact = Math.round(targetMinutes * 60 * 1000);
+        if (segments.length && Math.abs(totalDurationMs - exact) > 2) {
+          const last = segments[segments.length - 1];
+          last.endMs = exact;
+          totalDurationMs = exact;
+        }
+        totalDurationMs = exact;
+      }
+      const expectsPart2 = !!(segments.expectsPart2 || segments.some(s => s.expectsPart2 || s.cliffhanger));
+      updateJob(job.id, {
+        segments,
+        totalDurationMs,
+        noMedia: true,
+        mediaPath: null,
+        targetMinutes: targetMinutes || null,
+        partNumber,
+        expectsPart2,
+        truncatedForRuntime: !!segments.truncated,
+      });
+      if (expectsPart2) {
+        logForJob(job.id, 'story truncated to fit runtime — cliffhanger ending (Part 2 expected)', {
+          targetMinutes,
+          partNumber,
+          segments: segments.length,
+          totalDurationMs,
+        });
+      } else {
+        logForJob(job.id, 'segments ready', {
+          segments: segments.length,
+          totalDurationMs,
+          targetMinutes,
+        });
+      }
+    }
+
+    // --- PRE-PRODUCTION & SCREENPLAY (resume if already done) ---
+    updateJob(job.id, {
+      status: 'building_prompts',
+      progress: {
+        ...(job.progress || {}),
+        phase: 'preproduction',
+        detail: 'Writing screenplay & character refs via Grok…',
+      },
+    });
+    logForJob(job.id, 'pre-production: screenplay & canonical refs', {
+      videoType, resolution, hasMedia, segments: segments.length,
+    });
+
     // Generates screenplay.json and populates jobs/<id>/refs/
-    const screenplay = await runPreProduction(job, dir, segments);
+    // Heartbeat so the UI does not look frozen during long Grok calls.
+    const preprodHeartbeat = setInterval(() => {
+      try {
+        const cur = readJob(job.id);
+        if (!cur || cur.status !== 'building_prompts') return;
+        updateJob(job.id, {
+          progress: {
+            ...(cur.progress || {}),
+            phase: 'preproduction',
+            detail: 'Still building screenplay / refs (Grok is working)…',
+            heartbeatAt: new Date().toISOString(),
+          },
+        });
+        logForJob(job.id, 'pre-production still running (heartbeat)');
+      } catch (_) {}
+    }, 30000);
+
+    let screenplay;
+    try {
+      screenplay = await runPreProduction(job, dir, segments);
+    } finally {
+      clearInterval(preprodHeartbeat);
+    }
+    logForJob(job.id, 'pre-production done', {
+      hasScreenplay: !!screenplay,
+      scenes: screenplay?.scenes?.length || 0,
+    });
     
     // Extract and map screenplay beats strictly aligned with Whisper segments
     beats = [];
@@ -252,6 +425,12 @@ async function processJob(job) {
         cameraMovement: spBeat ? spBeat.cameraMovement : 'Gentle parallax drift',
         sfx: spBeat ? spBeat.sfx : [],
         music: spBeat ? spBeat.music : null,
+        // Rich acting-first fields from the director stack (may be undefined for documentary)
+        performance: spBeat ? spBeat.performance : undefined,
+        dialogue: spBeat && Array.isArray(spBeat.dialogue) ? spBeat.dialogue : [],
+        camera: spBeat ? spBeat.camera : undefined,
+        lighting: spBeat ? spBeat.lighting : undefined,
+        emotionalIntensity: spBeat && spBeat.emotionalIntensity != null ? spBeat.emotionalIntensity : undefined,
         emergentDetails: spBeat ? spBeat.emergentDetails : null
       });
     }
@@ -267,7 +446,7 @@ async function processJob(job) {
     // Each batch session generates the image AND video clip for its beats.
     // runBatch skips beats that already have both files (resume-safe).
     // Small batches reduce chance of hitting --max-turns before finishing.
-    prompts = buildPrompts(beats, styleSummary, job.script, { characters, sceneStyle, styleReferencePaths, screenplay });
+    prompts = buildPrompts(beats, styleSummary, job.script, { characters, sceneStyle, styleReferencePaths, screenplay, videoType, resolution });
     batches = chunkIntoBatches(prompts);
     const totalB = batches.length;
     if (startBatch >= totalB || startBatch < 0) startBatch = 0;
@@ -316,7 +495,7 @@ async function processJob(job) {
     let mixedAudioPath = null;
     try {
       updateJob(job.id, { status: 'mixing_audio' });
-      logForJob(job.id, 'mixing_audio');
+      logForJob(job.id, 'mixing_audio', { hasMedia });
       const outDir = path.join(dir, 'output');
       
       // Calculate actedBeats using actual generated clip durations on disk
@@ -336,19 +515,37 @@ async function processJob(job) {
           endMs
         });
       }
-      
-      mixedAudioPath = await mixAudio(job.mediaPath, beats, outDir, actedBeats);
+
+      if (hasMedia) {
+        // Voiceover-driven mix (voiceover + BGM + SFX).
+        mixedAudioPath = await mixAudio(mediaPath, beats, outDir, actedBeats);
+      } else {
+        // No media/voiceover: still build the BGM+SFX bed so acted.mp4 works,
+        // and use that bed as the final soundtrack (no narration).
+        await mixAudio(null, beats, outDir, actedBeats);
+        const actedBed = path.join(outDir, 'acted_audio.aac');
+        mixedAudioPath = fs.existsSync(actedBed) ? actedBed : null;
+      }
       logForJob(job.id, 'mixing_audio done', { mixedAudio: mixedAudioPath });
     } catch (mixErr) {
-      // Non-fatal: log warning and continue with raw voiceover
-      logForJob(job.id, 'mixing_audio WARN (non-fatal, using raw voiceover)', { error: String(mixErr && mixErr.message || mixErr) });
+      // Non-fatal: log warning and continue with whatever audio is available
+      logForJob(job.id, 'mixing_audio WARN (non-fatal)', { error: String(mixErr && mixErr.message || mixErr) });
       mixedAudioPath = null;
     }
 
     // --- STITCH (concat all clips + mux mixed audio) ---
     updateJob(job.id, { status: 'stitching' });
     logForJob(job.id, 'stitching');
-    await stitch({ jobDir: dir, beats, audioPath: job.mediaPath, mixedAudioPath, beatSeconds: BEAT_SECONDS, segments });
+    await stitch({
+      jobDir: dir,
+      beats,
+      audioPath: hasMedia ? mediaPath : null,
+      mixedAudioPath,
+      beatSeconds: BEAT_SECONDS,
+      segments,
+      resolution,
+      captionsEnabled: (customOptions.captionsOn != null ? !!customOptions.captionsOn : mode.captions),
+    });
 
     updateJob(job.id, { status: 'done', error: null });
     logForJob(job.id, 'done');
@@ -368,7 +565,8 @@ async function loop() {
   if (job) {
     // Extra verification after claim (defends against races at startup etc.)
     const verify = readJob(job.id);
-    if (!verify || verify.status !== 'transcribing' || verify.claimedBy !== job.claimedBy) {
+    // Claim uses status "processing" (worker then sets transcribing / building_prompts)
+    if (!verify || verify.status !== 'processing' || verify.claimedBy !== job.claimedBy) {
       logForJob(job.id || 'unknown', 'lost claim race after picking, skipping');
       setTimeout(loop, POLL_INTERVAL_MS);
       return;

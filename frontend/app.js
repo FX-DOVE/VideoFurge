@@ -5,6 +5,7 @@
 // =============================================================
 const STATUS_LABELS = {
   queued:           'Queued',
+  processing:       'Starting',
   transcribing:     'Transcribing',
   building_prompts: 'Building Prompts',
   generating:       'Generating',
@@ -16,10 +17,11 @@ const STATUS_LABELS = {
   rendering:        'Rendering edit',
 };
 
-const STATUS_STEPS = ['queued', 'transcribing', 'building_prompts', 'generating', 'mixing_audio', 'stitching', 'done'];
+const STATUS_STEPS = ['queued', 'processing', 'transcribing', 'building_prompts', 'generating', 'mixing_audio', 'stitching', 'done'];
 
 const STATUS_BADGE_CLASS = {
   queued:           'badge-queued',
+  processing:       'badge-transcribing',
   transcribing:     'badge-transcribing',
   building_prompts: 'badge-building',
   generating:       'badge-generating',
@@ -357,6 +359,18 @@ function fmtDate(iso) {
   });
 }
 
+/** Compact " · Part 1 · 3 min · cliffhanger" suffix for job cards / detail. */
+function _runtimeMeta(job) {
+  if (!job) return '';
+  const mins = job.targetMinutes || job.customOptions?.targetMinutes;
+  const part = job.partNumber || job.customOptions?.partNumber;
+  const bits = [];
+  if (part) bits.push(`Part ${part}`);
+  if (mins) bits.push(`${mins} min`);
+  if (job.expectsPart2) bits.push('cliffhanger → Part 2');
+  return bits.length ? ` · ${bits.join(' · ')}` : '';
+}
+
 function fmtRelative(iso) {
   if (!iso) return '';
   const d = Math.floor((Date.now() - new Date(iso)) / 1000);
@@ -378,6 +392,9 @@ function updateNavActive(active) {
 }
 
 function stepIndicatorHtml(status, progress) {
+  // Visual pipeline steps (order matters). "processing" maps onto the first active
+  // work step so claim-status does not shift the whole bar (that used to mark
+  // Building as done while still building, and light up Generating early).
   const steps = [
     { key: 'queued',           label: 'Queued' },
     { key: 'transcribing',     label: 'Transcribing' },
@@ -389,17 +406,23 @@ function stepIndicatorHtml(status, progress) {
   ];
 
   const isFailed = status === 'failed';
-  const currentIdx = isFailed ? -1 : STATUS_STEPS.indexOf(status);
+  // Normalize claim/start statuses onto real pipeline steps
+  let normStatus = status;
+  if (status === 'processing') {
+    // Claimed but not yet in a named phase — show as starting transcription/build
+    normStatus = 'transcribing';
+  }
+  const currentIdx = isFailed ? -1 : steps.findIndex(s => s.key === normStatus);
 
   return `<div class="steps">${steps.map((step, i) => {
     let cls = 'step';
-    if (!isFailed && i < currentIdx) cls += ' step-done';
-    if (!isFailed && i === currentIdx) cls += ' step-active';
+    if (!isFailed && currentIdx >= 0 && i < currentIdx) cls += ' step-done';
+    if (!isFailed && currentIdx >= 0 && i === currentIdx) cls += ' step-active';
 
     const genProgress = step.key === 'generating' && status === 'generating' && progress?.batchesTotal
       ? `<span class="step-progress">${progress.batchesDone}/${progress.batchesTotal}</span>` : '';
 
-    const dotInner = (i < currentIdx && !isFailed) ? '✓' : '';
+    const dotInner = (currentIdx >= 0 && i < currentIdx && !isFailed) ? '✓' : '';
 
     return `
       <div class="${cls}">
@@ -526,7 +549,7 @@ function _jobCardHtml(job) {
           <h3 class="job-card-title">${escHtml(job.title)}</h3>
           ${badgeHtml(job.status)}
         </div>
-        <div class="job-card-meta">${fmtDate(job.createdAt)} · ${fmtRelative(job.createdAt)}</div>
+        <div class="job-card-meta">${fmtDate(job.createdAt)} · ${fmtRelative(job.createdAt)}${_runtimeMeta(job)}</div>
       </div>
       ${genProgress}${editProgress}${errorRow}
       <div class="job-card-actions">
@@ -574,24 +597,96 @@ function _renderNewJob() {
           <h2 class="form-section-title">Job Details</h2>
           <div class="form-field">
             <label class="form-label" for="f-title">Title <span class="required">*</span></label>
-            <input type="text" id="f-title" class="form-input" placeholder="e.g. Product Launch Intro"
+            <input type="text" id="f-title" class="form-input" placeholder="e.g. The Betrayal — A Short Drama"
               maxlength="200" autocomplete="off" />
             <div class="field-hint"><span id="title-count">0</span>/200</div>
             <div class="field-error hidden" id="e-title"></div>
           </div>
+
           <div class="form-field">
-            <label class="form-label" for="f-script">Script / Narration <span class="required">*</span></label>
+            <label class="form-label">Video Type <span class="required">*</span></label>
+            <p class="form-section-desc" style="margin-bottom:8px;font-size:12px;">
+              Choose how the AI should direct your video. <strong>Drama</strong> and <strong>Movie</strong> add a full
+              Director stack (screenwriter → character → actor → camera) so characters truly act, talk, and emote —
+              understandable with the sound off.
+            </p>
+            <div id="video-type-grid" class="video-type-grid"></div>
+            <input type="hidden" id="f-video-type" value="documentary" />
+          </div>
+
+          <div class="form-field">
+            <label class="form-label">Aspect Ratio / Resolution</label>
+            <div id="aspect-grid" class="aspect-grid"></div>
+            <input type="hidden" id="f-resolution" value="16:9" />
+          </div>
+
+          <!-- Exact runtime for Drama / Movie / Anime (hidden for other types) -->
+          <div class="form-field runtime-field" id="runtime-field" hidden>
+            <label class="form-label">Video Length <span class="required">*</span></label>
+            <p class="form-section-desc" style="margin-bottom:10px;font-size:12px;">
+              The finished video will be <strong>exactly</strong> this long.
+              If your story is bigger than the time you pick, Part 1 ends on a
+              <strong>shocking cliffhanger</strong> so you can make Part 2 later.
+            </p>
+            <div class="runtime-presets" id="runtime-presets">
+              <button type="button" class="runtime-chip" data-min="1">1 min</button>
+              <button type="button" class="runtime-chip" data-min="2">2 min</button>
+              <button type="button" class="runtime-chip is-on" data-min="3">3 min</button>
+              <button type="button" class="runtime-chip" data-min="5">5 min</button>
+              <button type="button" class="runtime-chip" data-min="7">7 min</button>
+              <button type="button" class="runtime-chip" data-min="10">10 min</button>
+              <button type="button" class="runtime-chip" data-min="15">15 min</button>
+            </div>
+            <div class="runtime-custom-row">
+              <label class="form-label" for="f-target-minutes" style="margin:0;">Custom minutes</label>
+              <input type="number" id="f-target-minutes" class="form-input runtime-input" min="1" max="30" step="1" value="3" />
+              <span class="field-hint">1–30 minutes</span>
+            </div>
+            <div class="runtime-part-row">
+              <label class="form-label" for="f-part-number" style="margin:0;">Episode / Part #</label>
+              <input type="number" id="f-part-number" class="form-input runtime-input" min="1" max="50" step="1" value="1" />
+              <span class="field-hint">Use 2, 3… when continuing a cliffhanger</span>
+            </div>
+            <div class="field-error hidden" id="e-runtime"></div>
+          </div>
+
+          <div class="form-field">
+            <label class="form-label" for="f-script">
+              Script <span id="script-req" class="field-hint" style="font-weight:500;">(optional — leave blank and the AI will research &amp; write one from your title)</span>
+            </label>
             <textarea id="f-script" class="form-input form-textarea"
-              placeholder="The spoken words. The AI will generate visuals that literally act out what is being said in each moment. Be specific about actions, emotions, and who is doing what."
+              placeholder="Optional. For Drama/Movie/Anime you can paste your own script here. If left blank, the AI writes a part that fits your chosen length — and cliffhangers if the full story won't fit."
               maxlength="8000" rows="7"></textarea>
             <div class="field-hint"><span id="script-count">0</span>/8,000</div>
             <div class="field-error hidden" id="e-script"></div>
           </div>
+
+          <details class="form-field" id="customize-panel">
+            <summary style="cursor:pointer;font-weight:600;">Customize (optional)</summary>
+            <div style="margin-top:10px;display:grid;gap:10px;">
+              <div>
+                <label class="form-label" for="f-tone">Tone / Mood</label>
+                <input type="text" id="f-tone" class="form-input" maxlength="120" placeholder="e.g. suspenseful, heartwarming, gritty" />
+              </div>
+              <div>
+                <label class="form-label" for="f-language">Dialogue / Narration Language</label>
+                <input type="text" id="f-language" class="form-input" maxlength="40" placeholder="e.g. English, Pidgin, Yoruba" />
+              </div>
+              <label style="display:flex;align-items:center;gap:8px;font-size:13px;">
+                <input type="checkbox" id="f-captions" /> Burn karaoke captions into the final video
+              </label>
+              <div>
+                <label class="form-label" for="f-custom-prompt">Extra Direction</label>
+                <textarea id="f-custom-prompt" class="form-input form-textarea" rows="2" maxlength="2000"
+                  placeholder="Anything else the director should know (specific shots, references, do's and don'ts)."></textarea>
+              </div>
+            </div>
+          </details>
         </div>
 
         <div class="form-section">
-          <h2 class="form-section-title">Media File</h2>
-          <p class="form-section-desc">The audio or video narration (up to ~2 hours). Supported: MP3, WAV, M4A, AAC, OGG, FLAC, MP4, MOV, MKV, WebM, AVI.</p>
+          <h2 class="form-section-title" id="media-section-title">Media File <span class="required">*</span></h2>
+          <p class="form-section-desc" id="media-section-desc">Required for this video type. The system is audio-first: visuals are timed and matched to your narration so they match the script 100%. Supported: MP3, WAV, M4A, AAC, OGG, FLAC, MP4, MOV, MKV, WebM, AVI.</p>
           <div class="form-field">
             <div class="file-drop-zone" id="media-zone">
               <input type="file" id="f-media" class="file-input"
@@ -676,6 +771,184 @@ function _initNewJobForm() {
   document.getElementById('f-script').addEventListener('input', function () {
     document.getElementById('script-count').textContent = this.value.length.toLocaleString();
   });
+
+  // === Video type + aspect ratio pickers (from /api/config) ===
+  const MODE_CARD_IMAGES = {
+    documentary: 'assets/modes/documentary.jpg',
+    drama: 'assets/modes/drama.jpg',
+    movie: 'assets/modes/movie.jpg',
+    explainer: 'assets/modes/explainer.jpg',
+    commercial: 'assets/modes/commercial.jpg',
+    music_video: 'assets/modes/music_video.jpg',
+    cinematic_trailer: 'assets/modes/cinematic_trailer.jpg',
+    anime: 'assets/modes/anime.jpg',
+  };
+  const FALLBACK_MODES = [
+    { id: 'documentary', label: 'Documentary', description: 'Factual narration with cinematic B-roll and captions.', mediaRequired: true, fixedRuntime: false },
+    { id: 'drama', label: 'Drama', description: 'Emotional acting: characters cry, argue, love, betray. Dialogue performance.', mediaRequired: false, fixedRuntime: true, defaultTargetMinutes: 3 },
+    { id: 'movie', label: 'Movie / Film', description: 'Full cinematic production with acting and coverage.', mediaRequired: false, fixedRuntime: true, defaultTargetMinutes: 5 },
+    { id: 'explainer', label: 'Explainer', description: 'Clear teaching video, clean lighting.', mediaRequired: true, fixedRuntime: false },
+    { id: 'commercial', label: 'Commercial / Ad', description: 'Short punchy product-hero visuals.', mediaRequired: true, fixedRuntime: false },
+    { id: 'music_video', label: 'Music Video', description: 'Beat-synced stylised visuals.', mediaRequired: true, fixedRuntime: false },
+    { id: 'cinematic_trailer', label: 'Cinematic Trailer', description: 'High-tension montage, epic pacing.', mediaRequired: false, fixedRuntime: false },
+    { id: 'anime', label: 'Anime / Cartoon', description: 'Style-locked animated performance.', mediaRequired: false, fixedRuntime: true, defaultTargetMinutes: 3 },
+  ];
+  const FALLBACK_ASPECTS = [
+    { id: '16:9', label: 'Landscape (YouTube)' },
+    { id: '9:16', label: 'Vertical (Shorts/TikTok)' },
+    { id: '1:1', label: 'Square' },
+    { id: '4:5', label: 'Portrait' },
+    { id: '21:9', label: 'Cinematic wide' },
+    { id: '4:3', label: 'Classic' },
+  ];
+
+  // Track media-required + fixed-runtime per mode so validation + UI can react.
+  let _mediaRequiredByMode = {};
+  let _fixedRuntimeByMode = {};
+  let _defaultMinutesByMode = {};
+
+  function _applyMediaRequirement() {
+    const hidden = document.getElementById('f-video-type');
+    const modeId = hidden ? hidden.value : 'documentary';
+    const req = hidden ? (_mediaRequiredByMode[modeId] !== false) : true;
+    const titleEl = document.getElementById('media-section-title');
+    const descEl = document.getElementById('media-section-desc');
+    if (titleEl) {
+      titleEl.innerHTML = req
+        ? 'Media File <span class="required">*</span>'
+        : 'Media File <span class="field-hint" style="font-weight:500;">(optional for this type)</span>';
+    }
+    if (descEl) {
+      descEl.textContent = req
+        ? 'Required for this video type. The system is audio-first: visuals are timed and matched to your narration so they match the script 100%. Supported: MP3, WAV, M4A, AAC, OGG, FLAC, MP4, MOV, MKV, WebM, AVI.'
+        : "Optional for this video type. If you don't add one, the acted video is built entirely from your script/title (with music & sound, no voiceover). Supported: MP3, WAV, M4A, AAC, OGG, FLAC, MP4, MOV, MKV, WebM, AVI.";
+    }
+    _applyRuntimeField(modeId);
+  }
+
+  function _applyRuntimeField(modeId) {
+    const field = document.getElementById('runtime-field');
+    const minsInput = document.getElementById('f-target-minutes');
+    if (!field) return;
+    const fixed = !!_fixedRuntimeByMode[modeId];
+    field.hidden = !fixed;
+    if (fixed && minsInput) {
+      const def = _defaultMinutesByMode[modeId] || 3;
+      // Only seed default when empty / user hasn't touched, or switching modes
+      if (!minsInput.dataset.userSet) {
+        minsInput.value = String(def);
+        _syncRuntimeChips(def);
+      }
+    }
+  }
+
+  function _syncRuntimeChips(minutes) {
+    const m = Number(minutes) || 0;
+    document.querySelectorAll('#runtime-presets .runtime-chip').forEach(b => {
+      b.classList.toggle('is-on', Number(b.dataset.min) === m);
+    });
+  }
+
+  // Wire duration chips + custom input
+  document.getElementById('runtime-presets')?.addEventListener('click', (e) => {
+    const chip = e.target.closest('.runtime-chip');
+    if (!chip) return;
+    const mins = Number(chip.dataset.min);
+    const input = document.getElementById('f-target-minutes');
+    if (input) {
+      input.value = String(mins);
+      input.dataset.userSet = '1';
+    }
+    _syncRuntimeChips(mins);
+  });
+  document.getElementById('f-target-minutes')?.addEventListener('input', function () {
+    this.dataset.userSet = '1';
+    _syncRuntimeChips(this.value);
+  });
+
+  function paintVideoTypes(modes) {
+    const grid = document.getElementById('video-type-grid');
+    const hidden = document.getElementById('f-video-type');
+    if (!grid || !hidden) return;
+    _mediaRequiredByMode = {};
+    _fixedRuntimeByMode = {};
+    _defaultMinutesByMode = {};
+    modes.forEach(m => {
+      _mediaRequiredByMode[m.id] = m.mediaRequired !== false;
+      // Prefer server flag; fall back to known episodic modes
+      _fixedRuntimeByMode[m.id] = m.fixedRuntime === true
+        || ['drama', 'movie', 'anime'].includes(m.id);
+      _defaultMinutesByMode[m.id] = m.defaultTargetMinutes || (
+        m.id === 'movie' ? 5 : 3
+      );
+    });
+    grid.innerHTML = modes.map(m => {
+      const img = MODE_CARD_IMAGES[m.id] || m.image || '';
+      const imgHtml = img
+        ? `<span class="vt-thumb" aria-hidden="true"><img src="${escAttr(img)}" alt="" loading="lazy" decoding="async" /></span>`
+        : `<span class="vt-thumb vt-thumb-fallback" aria-hidden="true"></span>`;
+      return `
+      <button type="button" class="video-type-card${m.id === hidden.value ? ' selected' : ''}" data-type="${escAttr(m.id)}" data-aspect="${escAttr(m.defaultAspect || '')}">
+        ${imgHtml}
+        <span class="vt-body">
+          <span class="vt-label">${escHtml(m.label)}</span>
+          <span class="vt-desc">${escHtml(m.description || '')}</span>
+          <span class="vt-media">${m.mediaRequired !== false ? '🎙 audio required' : '✅ works without audio'}</span>
+        </span>
+      </button>`;
+    }).join('');
+    grid.querySelectorAll('.video-type-card').forEach(card => {
+      card.onclick = () => {
+        hidden.value = card.dataset.type;
+        grid.querySelectorAll('.video-type-card').forEach(c => c.classList.remove('selected'));
+        card.classList.add('selected');
+        // Nudge default aspect for this mode if user hasn't overridden
+        const a = card.dataset.aspect;
+        if (a && !hidden.dataset.userAspect) {
+          const rHidden = document.getElementById('f-resolution');
+          if (rHidden) {
+            rHidden.value = a;
+            document.querySelectorAll('#aspect-grid .aspect-card').forEach(c =>
+              c.classList.toggle('selected', c.dataset.aspect === a));
+          }
+        }
+        // Reset default minutes when switching into a fixed-runtime mode
+        const minsInput = document.getElementById('f-target-minutes');
+        if (minsInput) delete minsInput.dataset.userSet;
+        _applyMediaRequirement();
+      };
+    });
+    _applyMediaRequirement();
+  }
+
+  function paintAspects(aspects) {
+    const grid = document.getElementById('aspect-grid');
+    const hidden = document.getElementById('f-resolution');
+    if (!grid || !hidden) return;
+    grid.innerHTML = aspects.map(a => `
+      <button type="button" class="aspect-card${a.id === hidden.value ? ' selected' : ''}" data-aspect="${escAttr(a.id)}">
+        <span class="ar-ratio">${escHtml(a.id)}</span>
+        <span class="ar-label">${escHtml(a.label || '')}</span>
+      </button>`).join('');
+    grid.querySelectorAll('.aspect-card').forEach(card => {
+      card.onclick = () => {
+        hidden.value = card.dataset.aspect;
+        document.getElementById('f-video-type').dataset.userAspect = '1';
+        grid.querySelectorAll('.aspect-card').forEach(c => c.classList.remove('selected'));
+        card.classList.add('selected');
+      };
+    });
+  }
+
+  paintVideoTypes(FALLBACK_MODES);
+  paintAspects(FALLBACK_ASPECTS);
+  // Refine from server config if available
+  fetch('/api/config').then(r => r.json()).then(cfg => {
+    if (Array.isArray(cfg.videoTypes) && cfg.videoTypes.length) paintVideoTypes(cfg.videoTypes);
+    if (Array.isArray(cfg.aspectRatios) && cfg.aspectRatios.length) {
+      paintAspects(cfg.aspectRatios.map(a => ({ id: a.id, label: a.label })));
+    }
+  }).catch(() => {});
 
   // Media file selection
   const mediaInput = document.getElementById('f-media');
@@ -907,13 +1180,29 @@ function _initNewJobForm() {
     const script = document.getElementById('f-script').value.trim();
     const mediaFile = document.getElementById('f-media').files[0];
     const sceneStyle = (document.getElementById('f-scene-style')?.value || '').trim();
+    const videoType = (document.getElementById('f-video-type')?.value || 'documentary');
+    const resolution = (document.getElementById('f-resolution')?.value || '16:9');
+
+    const minsRaw = parseInt(document.getElementById('f-target-minutes')?.value, 10);
+    const partRaw = parseInt(document.getElementById('f-part-number')?.value, 10);
+    const customOptions = {
+      tone: (document.getElementById('f-tone')?.value || '').trim(),
+      dialogueLanguage: (document.getElementById('f-language')?.value || '').trim(),
+      targetMinutes: Number.isFinite(minsRaw) ? minsRaw : undefined,
+      partNumber: Number.isFinite(partRaw) && partRaw >= 1 ? partRaw : 1,
+      captionsOn: document.getElementById('f-captions')?.checked ? true : null,
+      customPrompt: (document.getElementById('f-custom-prompt')?.value || '').trim(),
+    };
 
     const validChars = (characters || []).filter(c => c.name && c.name.trim() && c.file);
 
     const fd = new FormData();
     fd.append('title', title);
-    fd.append('script', script);
-    fd.append('media', mediaFile);
+    if (script) fd.append('script', script);
+    if (mediaFile) fd.append('media', mediaFile);
+    fd.append('videoType', videoType);
+    fd.append('resolution', resolution);
+    fd.append('customOptions', JSON.stringify(customOptions));
     if (sceneStyle) fd.append('sceneStyle', sceneStyle);
 
     // Structured characters
@@ -1029,9 +1318,30 @@ function _validateNewJobForm(characters) {
 
   setErr('e-title', !title ? 'Title is required.'
     : title.length > 200 ? 'Title too long (max 200 characters).' : '');
-  setErr('e-script', !script ? 'Script is required.'
-    : script.length > 8000 ? 'Script too long (max 8,000 characters).' : '');
-  setErr('e-media', !media ? 'Please select a media file.' : '');
+  // Script is OPTIONAL — only validate length. Blank means the AI writes one from the title.
+  setErr('e-script', script.length > 8000 ? 'Script too long (max 8,000 characters).' : '');
+
+  // Media is required ONLY for audio-first modes (documentary, explainer, commercial,
+  // music video). Acted modes (drama, movie, cinematic_trailer, anime) may omit it.
+  const MEDIA_OPTIONAL_MODES = ['drama', 'movie', 'cinematic_trailer', 'anime'];
+  const FIXED_RUNTIME_MODES = ['drama', 'movie', 'anime'];
+  const selectedType = (document.getElementById('f-video-type')?.value || 'documentary');
+  const mediaOptional = MEDIA_OPTIONAL_MODES.includes(selectedType);
+  setErr('e-media', (!media && !mediaOptional)
+    ? 'A media (audio/video) file is required for this video type. Only Drama, Movie, Cinematic Trailer, and Anime can be created without media.'
+    : '');
+
+  // Exact length required for Drama / Movie / Anime
+  if (FIXED_RUNTIME_MODES.includes(selectedType)) {
+    const mins = parseInt(document.getElementById('f-target-minutes')?.value, 10);
+    setErr('e-runtime',
+      (!Number.isFinite(mins) || mins < 1 || mins > 30)
+        ? 'Choose a video length between 1 and 30 minutes. The finished video will be exactly that long.'
+        : ''
+    );
+  } else {
+    setErr('e-runtime', '');
+  }
 
   // Characters validation
   const validChars = (characters || []).filter(c => c.name && c.name.trim() && c.file);
@@ -1149,6 +1459,12 @@ function _paintJobDetail(job) {
         <a href="#/jobs/${job.id}/editor" class="btn btn-primary" id="btn-open-editor">
           ✂ Edit Clips
         </a>
+        ${job.status === 'done' ? `
+          <button type="button" class="btn btn-secondary" data-rerender-job="${escAttr(job.id)}"
+            title="Rebuild edited.mp4 with current Mix transitions and timeline">
+            🔄 Re-render
+          </button>
+        ` : ''}
         ${assets.video !== false ? `<a href="${escAttr(mediaUrl(`/api/jobs/${job.id}/download/video`))}"
           class="btn btn-secondary" download>⬇ Download Final Video (Voice + BGM + SFX)</a>` : ''}
         ${assets.acted !== false ? `<a href="${escAttr(mediaUrl(`/api/jobs/${job.id}/download/acted`))}"
@@ -1216,6 +1532,10 @@ function _paintJobDetail(job) {
         ${job.updatedAt ? `<div>
           <div class="detail-meta-label">Last Update</div>
           <div class="detail-meta-value">${fmtRelative(job.updatedAt)}</div>
+        </div>` : ''}
+        ${(job.targetMinutes || job.customOptions?.targetMinutes) ? `<div>
+          <div class="detail-meta-label">Runtime</div>
+          <div class="detail-meta-value">${escHtml(String(job.targetMinutes || job.customOptions.targetMinutes))} min exact${job.partNumber || job.customOptions?.partNumber ? ` · Part ${escHtml(String(job.partNumber || job.customOptions.partNumber))}` : ''}${job.expectsPart2 ? ' · cliffhanger (make Part 2 next)' : ''}</div>
         </div>` : ''}
         ${job.recovery ? `<div>
           <div class="detail-meta-label">Recovery</div>
@@ -1303,6 +1623,18 @@ function _paintJobDetail(job) {
   _wireVideoPlayer('result-video', 'result-video-error', 'Final');
   _wireVideoPlayer('result-acted-video', 'result-acted-video-error', 'Acted');
   _wireVideoPlayer('result-edited-video', 'result-edited-video-error', 'Edited');
+  _wireEditRerenderButtons();
+}
+
+function _wireEditRerenderButtons(root = document) {
+  root.querySelectorAll('[data-rerender-job]').forEach(btn => {
+    if (btn.dataset.wiredRerender === '1') return;
+    btn.dataset.wiredRerender = '1';
+    btn.addEventListener('click', () => {
+      const id = btn.getAttribute('data-rerender-job');
+      if (id) _queueEditRerender(id);
+    });
+  });
 }
 
 function _editRenderBannerHtml(job) {
@@ -1337,7 +1669,10 @@ function _editRenderBannerHtml(job) {
     return `
       <div class="edit-render-banner edit-render-failed" data-er-status="failed">
         <strong>❌ Edit render failed:</strong> ${escHtml(er.error || 'Unknown error')}
-        <a href="#/jobs/${job.id}/editor" class="btn btn-sm btn-secondary" style="margin-left:0.5rem;">Fix in Editor</a>
+        <div style="display:flex; flex-wrap:wrap; gap:0.5rem; margin-top:0.5rem;">
+          <button type="button" class="btn btn-sm btn-primary" data-rerender-job="${escAttr(job.id)}">▶ Retry render</button>
+          <a href="#/jobs/${job.id}/editor" class="btn btn-sm btn-secondary">Fix in Editor</a>
+        </div>
       </div>`;
   }
   if (er.status === 'done') {
@@ -1345,12 +1680,51 @@ function _editRenderBannerHtml(job) {
       <div class="edit-render-banner edit-render-done" data-er-status="done">
         <div>
           <strong>🎉 Edit render complete!</strong>
-          <span style="display:block; font-size:0.85rem; color:rgba(255,255,255,0.7); margin-top:0.25rem;">Your edited video is ready — download or preview below.</span>
+          <span style="display:block; font-size:0.85rem; color:rgba(255,255,255,0.7); margin-top:0.25rem;">Your edited video is ready — download, preview, or re-render with Mix transitions.</span>
         </div>
-        <a class="btn btn-sm btn-primary" href="${escAttr(mediaUrl(`/api/jobs/${job.id}/download/edited`))}" download style="background:#10b981; border-color:#10b981; color:white;">⬇ Download Edited Video</a>
+        <div style="display:flex; flex-wrap:wrap; gap:0.5rem; align-items:center;">
+          <a class="btn btn-sm btn-primary" href="${escAttr(mediaUrl(`/api/jobs/${job.id}/download/edited`))}" download style="background:#10b981; border-color:#10b981; color:white;">⬇ Download Edited Video</a>
+          <button type="button" class="btn btn-sm btn-secondary" data-rerender-job="${escAttr(job.id)}">🔄 Re-render</button>
+          <a href="#/jobs/${job.id}/editor" class="btn btn-sm btn-ghost">Open Editor</a>
+        </div>
       </div>`;
   }
   return '';
+}
+
+/** Queue a server edit re-render for a finished job (uses saved timeline). */
+async function _queueEditRerender(jobId) {
+  if (!jobId) return;
+  showConfirm(
+    'Re-render video',
+    'Rebuild the edited video on the server with the current timeline (Mix transitions, trims, audio)?\n\nYou can leave this page — download when it finishes.',
+    async () => {
+      try {
+        const resp = await apiFetch(`/api/jobs/${jobId}/editor/render`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({}),
+        });
+        if (!resp.ok) {
+          const err = await resp.json().catch(() => ({}));
+          throw new Error(err.error || `Re-render failed (${resp.status})`);
+        }
+        const data = await resp.json();
+        showToast('Re-render queued. Safe to leave — download when it finishes.', 'success', 6000);
+        // Refresh detail if we're on that job
+        if (location.hash.includes(`/jobs/${jobId}`) && !location.hash.includes('/editor')) {
+          _renderJobDetail(jobId);
+        }
+        // Nudge editor if open
+        if (typeof _applyEditorJobUpdate === 'function' && data.editRender) {
+          _applyEditorJobUpdate({ id: jobId, editRender: data.editRender });
+        }
+      } catch (e) {
+        showToast(e.message || String(e), 'error');
+      }
+    },
+    'Re-render'
+  );
 }
 
 function _setVideoStatus(videoId, text) {
@@ -1525,6 +1899,7 @@ function _applyJobDetailUpdate(job) {
       const html = `<div id="d-edit-render-slot" data-er-status="failed">${_editRenderBannerHtml(job)}</div>`;
       if (bannerSlot) {
         bannerSlot.outerHTML = html;
+        _wireEditRerenderButtons(document.getElementById('d-edit-render-slot') || document);
       } else {
         _paintJobDetail(job);
       }

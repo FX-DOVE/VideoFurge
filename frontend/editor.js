@@ -5,14 +5,39 @@
 // then queues a server render (safe to leave and download later).
 // =============================================================
 
+// CapCut-style join / transition options.
+// cut  = hard cut · mix = opacity blend (clips dissolve into each other) · xfade = fancy styles
+// Mix is NOT fade-through-black — that is "Fade black".
 const EDITOR_TRANSITIONS = [
-  { id: 'none', label: 'Cut' },
-  { id: 'fade', label: 'Fade' },
-  { id: 'dissolve', label: 'Dissolve' },
-  { id: 'fadeblack', label: 'Fade black' },
-  { id: 'slideleft', label: 'Slide ←' },
-  { id: 'slideright', label: 'Slide →' },
+  { id: 'none',        label: 'Cut',          kind: 'cut',   hint: 'Hard cut — no blend' },
+  { id: 'mix',         label: 'Mix',          kind: 'mix',   hint: 'Opacity blend — clips dissolve into each other (recommended for acted)' },
+  { id: 'fade',        label: 'Crossfade',    kind: 'xfade', hint: 'Overlapping crossfade (same visual as Mix)' },
+  { id: 'dissolve',    label: 'Dissolve',     kind: 'xfade', hint: 'Classic dissolve' },
+  { id: 'fadeblack',   label: 'Fade black',   kind: 'xfade', hint: 'Fade through black (dips to black between clips)' },
+  { id: 'fadewhite',   label: 'Fade white',   kind: 'xfade', hint: 'Fade through white' },
+  { id: 'slideleft',   label: 'Slide ←',      kind: 'xfade', hint: 'Slide from right' },
+  { id: 'slideright',  label: 'Slide →',      kind: 'xfade', hint: 'Slide from left' },
+  { id: 'slideup',     label: 'Slide ↑',      kind: 'xfade', hint: 'Slide from bottom' },
+  { id: 'slidedown',   label: 'Slide ↓',      kind: 'xfade', hint: 'Slide from top' },
+  { id: 'wipeleft',    label: 'Wipe ←',       kind: 'xfade', hint: 'Wipe left' },
+  { id: 'wiperight',   label: 'Wipe →',       kind: 'xfade', hint: 'Wipe right' },
+  { id: 'circleopen',  label: 'Circle open',  kind: 'xfade', hint: 'Expanding circle' },
+  { id: 'circleclose', label: 'Circle close', kind: 'xfade', hint: 'Closing circle' },
+  { id: 'distance',    label: 'Distance',     kind: 'xfade', hint: 'Zoom distance blend' },
+  { id: 'pixelize',    label: 'Pixelize',     kind: 'xfade', hint: 'Pixel dissolve' },
 ];
+
+const DEFAULT_TRANSITION = 'mix';
+const DEFAULT_TRANSITION_DURATION = 0.5;
+
+function _editorTransDef(id) {
+  return EDITOR_TRANSITIONS.find(t => t.id === id) || EDITOR_TRANSITIONS[0];
+}
+
+function _editorDefaultTransDur(timeline) {
+  const d = Number(timeline?.defaultTransitionDuration);
+  return Number.isFinite(d) ? Math.max(0, Math.min(2, d)) : DEFAULT_TRANSITION_DURATION;
+}
 
 const EDITOR_SIDE_TABS = [
   { key: 'story', label: 'Story', icon: 'story' },
@@ -236,7 +261,26 @@ function _initEditorState(jobId, data) {
       color: '#ffffff', bgColor: '#000000', position: 'bottom', style: 'shadow',
     };
   }
-  if (!timeline.defaultTransition) timeline.defaultTransition = 'fade';
+  if (!timeline.defaultTransition) timeline.defaultTransition = DEFAULT_TRANSITION;
+  if (timeline.defaultTransitionDuration == null || !Number.isFinite(Number(timeline.defaultTransitionDuration))) {
+    timeline.defaultTransitionDuration = DEFAULT_TRANSITION_DURATION;
+  }
+  // Migrate older timelines that used "fade" as the soft default → Mix @ 0.5s
+  // (only when every non-first clip still has the old stock fade@0.35)
+  if (timeline.defaultTransition === 'fade' && !timeline._transMigrated) {
+    const allOldFade = (timeline.clips || []).every((c, i) =>
+      i === 0 || (c.transition === 'fade' && Math.abs(Number(c.transitionDuration) - 0.35) < 0.02)
+    );
+    if (allOldFade) {
+      timeline.defaultTransition = DEFAULT_TRANSITION;
+      timeline.defaultTransitionDuration = DEFAULT_TRANSITION_DURATION;
+      (timeline.clips || []).forEach((c, i) => {
+        if (i === 0) { c.transition = 'none'; c.transitionDuration = 0; }
+        else { c.transition = DEFAULT_TRANSITION; c.transitionDuration = DEFAULT_TRANSITION_DURATION; }
+      });
+    }
+    timeline._transMigrated = true;
+  }
   if (!timeline.resolution) timeline.resolution = '1920x1080';
   // Audio tracks
   if (!timeline.bgMusic)    timeline.bgMusic    = { enabled: false, filename: '', volume: 0.4, url: '' };
@@ -340,9 +384,9 @@ function _paintEditor() {
       <a href="#/jobs/${escAttr(_editor.jobId)}" class="ce-back" title="Back to job">←</a>
       <div class="ce-title-block">
         <div class="ce-title">${escHtml(_editor.title)}</div>
-        <div class="ce-sub">${enabled.length} clips · ${_fmtEditorDur(total)} · assembled — edit then Render</div>
+        <div class="ce-sub">${enabled.length} clips · ${_fmtEditorDur(total)} · edit timeline, then <strong>Render</strong> / <strong>Re-render</strong></div>
       </div>
-      <div class="ce-top-actions" style="display: flex; align-items: center; gap: 0.5rem;">
+      <div class="ce-top-actions" style="display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap;">
         ${busy ? `
           <div class="ce-render-status" style="font-size: 0.8rem; color: #a5b4fc; display: flex; align-items: center; gap: 0.35rem; font-weight: 500; margin-right: 0.5rem;">
             <span class="ce-render-spinner" style="width: 12px; height: 12px; border: 1.8px solid #a5b4fc; border-top-color: transparent; border-radius: 50%; display: inline-block; animation: ce-spin 0.8s linear infinite;"></span>
@@ -352,15 +396,19 @@ function _paintEditor() {
         <button type="button" class="ce-icon-btn" id="ce-undo" title="Undo (Ctrl+Z)" ${busy || _editor.historyPos <= 0 ? 'disabled' : ''}>↩</button>
         <button type="button" class="ce-icon-btn" id="ce-redo" title="Redo (Ctrl+Y)" ${busy || _editor.historyPos >= _editor.history.length - 1 ? 'disabled' : ''}>↪</button>
         <button type="button" class="btn btn-ghost btn-sm" id="ce-save" ${busy ? 'disabled' : ''}>💾 Save</button>
-        ${er.status === 'done' ? `
+        ${(er.status === 'done' || _editor.assets?.edited) ? `
           <a class="btn btn-sm" href="${escAttr(mediaUrl(`/api/jobs/${_editor.jobId}/download/edited`))}" download style="background: #10b981; border-color: #10b981; color: white;">
             ⬇ Download MP4
           </a>
-        ` : `
-          <button type="button" class="btn btn-primary btn-sm" id="ce-render" ${busy ? 'disabled' : ''}>
-            ${busy ? 'Rendering…' : '▶ Render'}
-          </button>
-        `}
+        ` : ''}
+        <button type="button" class="btn btn-primary btn-sm" id="ce-render" ${busy ? 'disabled' : ''}
+          title="${er.status === 'done' || _editor.assets?.edited ? 'Re-render the full video with current timeline & transitions (e.g. Mix)' : 'Render the edited video on the server'}">
+          ${busy
+            ? 'Rendering…'
+            : (er.status === 'done' || _editor.assets?.edited
+              ? '🔄 Re-render'
+              : (er.status === 'failed' ? '▶ Retry render' : '▶ Render'))}
+        </button>
       </div>
       ${busy ? `<div class="ce-topbar-progress-line" style="position: absolute; bottom: 0; left: 0; height: 3px; background: linear-gradient(90deg, #6366f1, #8b5cf6); width: ${pct}%; transition: width 0.4s ease;"></div>` : ''}
     </header>
@@ -573,7 +621,7 @@ function _ceSidePanelHtml(selected, selMeta, busy) {
               <div class="ce-story-meta">
                 <span class="ce-badge-vid">VID</span>
                 <span>${_fmtEditorTime(_clipDuration(item))}</span>
-                ${item.transition && item.transition !== 'none' ? `<span class="ce-badge-fx">${escHtml(item.transition)}</span>` : ''}
+                ${item.transition && item.transition !== 'none' ? `<span class="ce-badge-fx" title="${escAttr(_editorTransDef(item.transition).hint)}">${escHtml(_editorTransDef(item.transition).label)}${item.transitionDuration ? ` ${Number(item.transitionDuration).toFixed(1)}s` : ''}</span>` : ''}
               </div>
             </div>`;
         }).join('') || '<p class="ce-empty">No matching clips.</p>'}
@@ -643,17 +691,24 @@ function _ceSidePanelHtml(selected, selMeta, busy) {
 
         <label>Transition in
           <select id="ed-transition" ${busy ? 'disabled' : ''}>
-            ${EDITOR_TRANSITIONS.map(t => `
-              <option value="${t.id}" ${selected.transition === t.id ? 'selected' : ''}>${escHtml(t.label)}</option>
-            `).join('')}
+            <optgroup label="Basic">
+              ${EDITOR_TRANSITIONS.filter(t => t.kind === 'cut' || t.kind === 'mix').map(t => `
+                <option value="${t.id}" ${selected.transition === t.id ? 'selected' : ''} title="${escAttr(t.hint)}">${escHtml(t.label)}</option>
+              `).join('')}
+            </optgroup>
+            <optgroup label="Crossfade / xfade">
+              ${EDITOR_TRANSITIONS.filter(t => t.kind === 'xfade').map(t => `
+                <option value="${t.id}" ${selected.transition === t.id ? 'selected' : ''} title="${escAttr(t.hint)}">${escHtml(t.label)}</option>
+              `).join('')}
+            </optgroup>
           </select>
         </label>
         <label>Transition length (s)
           <input type="number" id="ed-trans-dur" min="0" max="2" step="0.05"
-            value="${Number(selected.transitionDuration || 0.35).toFixed(2)}"
+            value="${Number(selected.transitionDuration ?? _editorDefaultTransDur(_editor.timeline)).toFixed(2)}"
             ${busy || (selected.transition || 'none') === 'none' ? 'disabled' : ''}/>
         </label>
-        <p class="ce-hint">Source ${_fmtEditorTime(maxDur)}. Drag the <strong>left</strong> or <strong>right</strong> edges on the timeline to trim. <kbd>S</kbd> cut &middot; <kbd>Del</kbd> delete.</p>
+        <p class="ce-hint">${escHtml(_editorTransDef(selected.transition || 'none').hint)}. <strong>Mix @ 0.5s</strong> blends clips together (no black dip). Use <strong>Fade black</strong> only if you want a fade through black. Source ${_fmtEditorTime(maxDur)}. <kbd>S</kbd> cut &middot; <kbd>Del</kbd> delete.</p>
       </div>`;
   }
 
@@ -783,8 +838,10 @@ function _ceSidePanelHtml(selected, selMeta, busy) {
   }
 
   // layout
+  const defTr = _editor.timeline.defaultTransition || DEFAULT_TRANSITION;
+  const defDur = _editorDefaultTransDur(_editor.timeline);
   return `
-    <div class="ce-side-head"><h3>Layout</h3><p>Output resolution and default transitions.</p></div>
+    <div class="ce-side-head"><h3>Layout</h3><p>Output resolution and default transitions between clips.</p></div>
     <div class="ce-fields">
       <label>Resolution
         <select id="ce-resolution" ${busy ? 'disabled' : ''}>
@@ -793,16 +850,33 @@ function _ceSidePanelHtml(selected, selMeta, busy) {
           <option value="3840x2160" ${_editor.timeline.resolution === '3840x2160' ? 'selected' : ''}>4K</option>
         </select>
       </label>
-      <label>Default transition (new / reset)
-        <div class="ce-seg-btns" id="ce-def-trans">
-          ${EDITOR_TRANSITIONS.slice(0, 4).map(t => `
-            <button type="button" data-tr="${t.id}" class="${_editor.timeline.defaultTransition === t.id ? 'is-on' : ''}" ${busy ? 'disabled' : ''}>${escHtml(t.label)}</button>
+      <label>Default transition
+        <div class="ce-seg-btns ce-trans-btns" id="ce-def-trans">
+          ${EDITOR_TRANSITIONS.filter(t => t.kind === 'cut' || t.kind === 'mix' || t.id === 'fade' || t.id === 'fadeblack' || t.id === 'slideleft').map(t => `
+            <button type="button" data-tr="${t.id}" class="${defTr === t.id ? 'is-on' : ''}" ${busy ? 'disabled' : ''} title="${escAttr(t.hint)}">${escHtml(t.label)}</button>
           `).join('')}
         </div>
+      </label>
+      <label>More transitions
+        <select id="ce-def-trans-more" ${busy ? 'disabled' : ''}>
+          ${EDITOR_TRANSITIONS.map(t => `
+            <option value="${t.id}" ${defTr === t.id ? 'selected' : ''}>${escHtml(t.label)} — ${escHtml(t.hint)}</option>
+          `).join('')}
+        </select>
+      </label>
+      <label>Default length (s)
+        <input type="number" id="ce-def-trans-dur" min="0" max="2" step="0.05"
+          value="${defDur.toFixed(2)}"
+          ${busy || defTr === 'none' ? 'disabled' : ''}/>
       </label>
       <button type="button" class="btn btn-sm btn-secondary" id="ce-apply-trans-all" ${busy ? 'disabled' : ''}>
         Apply default transition to all cuts
       </button>
+      <p class="ce-hint">
+        <strong>Cut</strong> = hard cut · <strong>Mix</strong> = opacity dissolve between clips (recommended for acted, try 0.5s) ·
+        <strong>Fade black</strong> = dips through black ·
+        <strong>Slides / wipes</strong> = fancy xfade (Voice mode; Acted auto-converts them to Mix).
+      </p>
       <p class="ce-hint">Space = play/pause &middot; Drag timeline to scrub &middot; Ctrl+Z undo</p>
     </div>`;
 }
@@ -831,8 +905,11 @@ function _ceTrackHtml() {
     const maxDur = meta?.duration || item.trimEnd || dur;
     const frontPct = maxDur > 0 ? Math.min(40, ((item.trimStart || 0) / maxDur) * 100) : 0;
     const backPct = maxDur > 0 ? Math.min(40, (Math.max(0, maxDur - (item.trimEnd || maxDur)) / maxDur) * 100) : 0;
-    const transBadge = item.transition && item.transition !== 'none'
-      ? `<span class="ce-trans-badge" title="${escAttr(item.transition)}">&#8631;</span>` : '';
+    const trLabel = item.transition && item.transition !== 'none'
+      ? `${_editorTransDef(item.transition).label}${item.transitionDuration ? ` ${Number(item.transitionDuration).toFixed(1)}s` : ''}`
+      : '';
+    const transBadge = trLabel
+      ? `<span class="ce-trans-badge" title="${escAttr(trLabel + ' — ' + _editorTransDef(item.transition).hint)}">&#8631; ${escHtml(_editorTransDef(item.transition).label)}</span>` : '';
     
     // Resolve cache-busted AI-generated thumbnail url for clip
     const frameUrl = mediaUrl(`/api/jobs/${_editor.jobId}/preview/frame/${item.sourceIndex}`);
@@ -919,11 +996,21 @@ function _ceRenderBannerHtml(er) {
   if (!er || !er.status || er.status === 'idle') {
     if (_editor?.assets?.edited) {
       return `<div class="edit-render-banner edit-render-done" id="ce-render-banner">
-        Last edit ready &mdash;
-        <a class="btn btn-sm btn-primary" href="${escAttr(mediaUrl(`/api/jobs/${_editor.jobId}/download/edited`))}" download>⬇ Download MP4</a>
+        <div style="display:flex; flex-wrap:wrap; align-items:center; gap:0.5rem;">
+          <strong>Last edit ready</strong>
+          <a class="btn btn-sm btn-primary" href="${escAttr(mediaUrl(`/api/jobs/${_editor.jobId}/download/edited`))}" download>⬇ Download MP4</a>
+          <button type="button" class="btn btn-sm btn-secondary" id="ce-render-banner-btn">🔄 Re-render</button>
+        </div>
+        <span class="ce-hint" style="display:block; margin-top:0.35rem;">Re-render applies current transitions (Mix), trims, and audio to a new edited.mp4.</span>
       </div>`;
     }
-    return '';
+    return `<div class="edit-render-banner" id="ce-render-banner" style="opacity:0.9;">
+      <div style="display:flex; flex-wrap:wrap; align-items:center; gap:0.5rem;">
+        <strong>Ready to render</strong>
+        <button type="button" class="btn btn-sm btn-primary" id="ce-render-banner-btn">▶ Render video</button>
+      </div>
+      <span class="ce-hint" style="display:block; margin-top:0.35rem;">Assembles all clips with your Mix transitions into one downloadable MP4.</span>
+    </div>`;
   }
   if (er.status === 'queued' || er.status === 'rendering') {
     const phase = er.progress?.phase || er.status;
@@ -946,13 +1033,20 @@ function _ceRenderBannerHtml(er) {
   }
   if (er.status === 'failed') {
     return `<div class="edit-render-banner edit-render-failed" id="ce-render-banner">
-      <strong>Render failed:</strong> ${escHtml(er.error || 'Unknown error')}
+      <div style="display:flex; flex-wrap:wrap; align-items:center; gap:0.5rem;">
+        <strong>Render failed:</strong> ${escHtml(er.error || 'Unknown error')}
+        <button type="button" class="btn btn-sm btn-primary" id="ce-render-banner-btn">▶ Retry render</button>
+      </div>
     </div>`;
   }
   if (er.status === 'done') {
     return `<div class="edit-render-banner edit-render-done" id="ce-render-banner">
-      <strong>Render complete!</strong>
-      <a class="btn btn-sm btn-primary" href="${escAttr(mediaUrl(`/api/jobs/${_editor.jobId}/download/edited`))}" download>⬇ Download MP4</a>
+      <div style="display:flex; flex-wrap:wrap; align-items:center; gap:0.5rem;">
+        <strong>Render complete!</strong>
+        <a class="btn btn-sm btn-primary" href="${escAttr(mediaUrl(`/api/jobs/${_editor.jobId}/download/edited`))}" download>⬇ Download MP4</a>
+        <button type="button" class="btn btn-sm btn-secondary" id="ce-render-banner-btn">🔄 Re-render</button>
+      </div>
+      <span class="ce-hint" style="display:block; margin-top:0.35rem;">Changed Mix / trims / audio? Re-render to rebuild the full video.</span>
     </div>`;
   }
   return '';
@@ -987,6 +1081,7 @@ function _ceRenderOverlayHtml(er) {
           <video controls class="ce-modal-video" src="${escAttr(mediaUrl(`/api/jobs/${_editor.jobId}/preview/edited`))}&_t=${Date.now()}"></video>
           <div class="ce-modal-actions">
             <a class="btn btn-primary" href="${escAttr(mediaUrl(`/api/jobs/${_editor.jobId}/download/edited`))}" download>⬇ Download MP4</a>
+            <button type="button" class="btn btn-secondary" id="ce-overlay-rerender">🔄 Re-render</button>
             <button type="button" class="btn btn-ghost" id="ce-dismiss-overlay">Close</button>
           </div>
         </div>
@@ -999,7 +1094,10 @@ function _ceRenderOverlayHtml(er) {
           <div class="ce-fail-icon">&#10007;</div>
           <h3>Render failed</h3>
           <p>${escHtml(er.error || 'Unknown error')}</p>
-          <button type="button" class="btn btn-ghost" id="ce-dismiss-overlay">Close</button>
+          <div class="ce-modal-actions">
+            <button type="button" class="btn btn-primary" id="ce-overlay-rerender">▶ Retry render</button>
+            <button type="button" class="btn btn-ghost" id="ce-dismiss-overlay">Close</button>
+          </div>
         </div>
       </div>`;
   }
@@ -1014,6 +1112,11 @@ function _wireEditorEvents(busy) {
   document.getElementById('ce-redo')?.addEventListener('click', () => _editorRedo());
   document.getElementById('ce-save')?.addEventListener('click', () => _editorSave());
   document.getElementById('ce-render')?.addEventListener('click', () => _editorRender());
+  document.getElementById('ce-render-banner-btn')?.addEventListener('click', () => _editorRender());
+  document.getElementById('ce-overlay-rerender')?.addEventListener('click', () => {
+    document.getElementById('ce-overlay-modal')?.remove();
+    _editorRender();
+  });
 
   // Transport controls
   document.getElementById('ed-play')?.addEventListener('click', () => _editorTogglePlay());
@@ -1087,8 +1190,8 @@ function _wireEditorEvents(busy) {
           trimStart: 0,
           trimEnd: Number((c.duration || 0).toFixed(3)),
           speed: 1,
-          transition: i === 0 ? 'none' : (_editor.timeline.defaultTransition || 'fade'),
-          transitionDuration: 0.35,
+          transition: i === 0 ? 'none' : (_editor.timeline.defaultTransition || DEFAULT_TRANSITION),
+          transitionDuration: i === 0 ? 0 : _editorDefaultTransDur(_editor.timeline),
         }));
         _editor.selectedId = _editor.timeline.clips[0]?.id || null;
         _editor.playhead = 0;
@@ -1310,7 +1413,7 @@ function _wireEditorEvents(busy) {
       if (!item) return;
       item.transition = e.target.value;
       if (item.transition === 'none') item.transitionDuration = 0;
-      else if (!item.transitionDuration) item.transitionDuration = 0.35;
+      else if (!item.transitionDuration) item.transitionDuration = _editorDefaultTransDur(_editor.timeline);
       _editorPushHistory();
       _paintEditor();
     });
@@ -1349,19 +1452,38 @@ function _wireEditorEvents(busy) {
     document.querySelectorAll('#ce-def-trans button').forEach(b => {
       b.addEventListener('click', () => {
         _editor.timeline.defaultTransition = b.dataset.tr;
+        if (b.dataset.tr === 'none') _editor.timeline.defaultTransitionDuration = 0;
+        else if (!_editor.timeline.defaultTransitionDuration) {
+          _editor.timeline.defaultTransitionDuration = DEFAULT_TRANSITION_DURATION;
+        }
         _editorPushHistory();
         _paintEditor();
       });
     });
+    document.getElementById('ce-def-trans-more')?.addEventListener('change', (e) => {
+      _editor.timeline.defaultTransition = e.target.value;
+      if (e.target.value === 'none') _editor.timeline.defaultTransitionDuration = 0;
+      else if (!_editor.timeline.defaultTransitionDuration) {
+        _editor.timeline.defaultTransitionDuration = DEFAULT_TRANSITION_DURATION;
+      }
+      _editorPushHistory();
+      _paintEditor();
+    });
+    document.getElementById('ce-def-trans-dur')?.addEventListener('change', (e) => {
+      _editor.timeline.defaultTransitionDuration = Math.max(0, Math.min(2, Number(e.target.value) || 0));
+      _editorPushHistory();
+    });
     document.getElementById('ce-apply-trans-all')?.addEventListener('click', () => {
-      const tr = _editor.timeline.defaultTransition || 'fade';
+      const tr = _editor.timeline.defaultTransition || DEFAULT_TRANSITION;
+      const dur = tr === 'none' ? 0 : _editorDefaultTransDur(_editor.timeline);
       _editor.timeline.clips.forEach((c, i) => {
         if (i === 0) { c.transition = 'none'; c.transitionDuration = 0; }
-        else { c.transition = tr; c.transitionDuration = tr === 'none' ? 0 : 0.35; }
+        else { c.transition = tr; c.transitionDuration = dur; }
       });
       _editorPushHistory();
       _paintEditor();
-      showToast('Transitions applied to all cuts.', 'success');
+      const label = _editorTransDef(tr).label;
+      showToast(`Applied ${label}${dur ? ` @ ${dur}s` : ''} to all cuts.`, 'success');
     });
   }
 
@@ -1769,8 +1891,8 @@ function _editorSplitAtPlayhead() {
     ...item,
     id: `c${Date.now()}-${item.sourceIndex}`,
     trimStart: Number(cutAt.toFixed(3)),
-    transition: item.transition || _editor.timeline.defaultTransition || 'fade',
-    transitionDuration: item.transitionDuration || 0.35,
+    transition: item.transition || _editor.timeline.defaultTransition || DEFAULT_TRANSITION,
+    transitionDuration: item.transitionDuration || _editorDefaultTransDur(_editor.timeline),
   };
   item.trimEnd = Number(cutAt.toFixed(3));
   const idx = _editor.timeline.clips.findIndex(c => c.id === item.id);
@@ -2045,14 +2167,30 @@ async function _editorSave() {
 
 async function _editorRender() {
   if (!_editor) return;
+  if (_editorIsBusy()) {
+    showToast('A render is already in progress.', 'info');
+    return;
+  }
   const enabled = _editorEnabledClips();
   if (!enabled.length) {
     showToast('Enable at least one clip before rendering.', 'error');
     return;
   }
+  const er = _editor.editRender || {};
+  const isRerender = er.status === 'done' || er.status === 'failed' || !!_editor.assets?.edited;
+  const title = isRerender
+    ? (er.status === 'failed' ? 'Retry render' : 'Re-render video')
+    : 'Render edited video';
+  const body = isRerender
+    ? `Re-render ${enabled.length} clip(s) with the current timeline?\n\n• Transitions (Mix / cut / etc.)\n• Trims, order, and audio settings\n\nThis rebuilds edited.mp4 on the server. You can close this tab — come back later to download.`
+    : `Render ${enabled.length} clip(s) on the server?\n\nYou can close this tab — processing continues in the background. Come back later to download.`;
+  const confirmLabel = isRerender
+    ? (er.status === 'failed' ? 'Retry render' : 'Re-render')
+    : 'Render';
+
   showConfirm(
-    'Render edited video',
-    `Render ${enabled.length} clip(s) on the server?\n\nYou can close this tab — processing continues in the background. Come back later to download.`,
+    title,
+    body,
     async () => {
       try {
         const resp = await apiFetch(`/api/jobs/${_editor.jobId}/editor/render`, {
@@ -2068,12 +2206,18 @@ async function _editorRender() {
         _editor.editRender = data.editRender || { status: 'queued' };
         _editor.dirty = false;
         _paintEditor();
-        showToast('Render queued. Safe to leave — download when it finishes.', 'success', 6000);
+        showToast(
+          isRerender
+            ? 'Re-render queued. Safe to leave — download when it finishes.'
+            : 'Render queued. Safe to leave — download when it finishes.',
+          'success',
+          6000
+        );
       } catch (e) {
         showToast(e.message, 'error');
       }
     },
-    'Render'
+    confirmLabel
   );
 }
 

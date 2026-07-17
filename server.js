@@ -16,6 +16,8 @@ const { Server: SocketIO } = require('socket.io');
 const {
   createJob, readJob, updateJob, deleteJob, jobDir, jobStorageBytes, JOBS_DIR,
 } = require('./lib/jobStore');
+const { listModes, normalizeModeId, getMode, isMediaRequired, hasFixedRuntime } = require('./lib/videoModes');
+const { normalizeAspectKey, ASPECT_PRESETS } = require('./lib/aspect');
 
 const app        = express();
 const httpServer = createServer(app);
@@ -127,6 +129,8 @@ app.get('/api/config', (req, res) => {
   res.json({
     apiKey: API_KEYS[0] || 'dev',
     dev:    API_KEYS.length === 0,
+    videoTypes: listModes(),
+    aspectRatios: Object.entries(ASPECT_PRESETS).map(([id, v]) => ({ id, label: v.label, w: v.w, h: v.h })),
   });
 });
 
@@ -134,6 +138,18 @@ app.get('/api/config', (req, res) => {
 app.use('/api/jobs', requireAuth);
 
 // ---- Helpers ----
+
+// Small input sanitizers for customOptions.
+function str(v, max = 200) {
+  if (v == null) return '';
+  return String(v).trim().slice(0, max);
+}
+function clampInt(v, lo, hi) {
+  const n = parseInt(v, 10);
+  if (!Number.isFinite(n)) return null;
+  return Math.max(lo, Math.min(hi, n));
+}
+
 
 // Which output files exist (so the UI only shows working players / download links).
 function getJobAssets(job) {
@@ -198,6 +214,11 @@ function jobSummary(job) {
     id:        job.id,
     title:     job.title,
     status:    job.status,
+    videoType: job.videoType || 'documentary',
+    resolution: job.resolution || '16:9',
+    targetMinutes: job.targetMinutes || job.customOptions?.targetMinutes || null,
+    partNumber: job.partNumber || job.customOptions?.partNumber || null,
+    expectsPart2: !!job.expectsPart2,
     createdAt: job.createdAt,
     updatedAt: job.updatedAt  || null,
     progress:  job.progress,
@@ -243,26 +264,67 @@ app.post(
         return res.status(507).json({ error: 'VPS storage is near capacity, delete old jobs first' });
       }
 
-      const { title, script, characters: charactersRaw, sceneStyle } = req.body;
+      const { title, script, characters: charactersRaw, sceneStyle, videoType, resolution, customOptions: customOptionsRaw } = req.body;
 
-      if (!title || !script) {
-        return res.status(400).json({ error: 'title and script are required' });
+      if (!title) {
+        return res.status(400).json({ error: 'title is required' });
       }
-      if (!req.files?.media) {
-        return res.status(400).json({ error: 'media file is required' });
-      }
+      // Media is now OPTIONAL. When absent, the worker builds the video from the
+      // (provided or AI-generated) script. Require at least title so a script can be written.
 
-      if (typeof script !== 'string' || script.length > MAX_SCRIPT_CHARS) {
+      // Script is now OPTIONAL. When empty, the worker generates one from the title.
+      if (script != null && (typeof script !== 'string' || script.length > MAX_SCRIPT_CHARS)) {
         return res.status(400).json({ error: `script too long (max ${MAX_SCRIPT_CHARS} chars)` });
       }
       if (title.length > 200) {
         return res.status(400).json({ error: 'title too long (max 200 chars)' });
       }
 
-      const media = req.files.media[0];
-      const badMedia = !ALLOWED_EXT.test(media.originalname) && !ALLOWED_MIME.test(media.mimetype || '');
-      if (badMedia) {
-        return res.status(400).json({ error: 'media must be an audio or video file' });
+      // Video type + aspect ratio (validated/normalized against known presets).
+      const normVideoType = normalizeModeId(videoType);
+      const normResolution = normalizeAspectKey(resolution || getMode(normVideoType).defaultAspect);
+
+      // Optional freeform customization (tone, pacing, captions on/off, language, target minutes).
+      let customOptions = {};
+      if (customOptionsRaw) {
+        try {
+          const parsed = typeof customOptionsRaw === 'string' ? JSON.parse(customOptionsRaw) : customOptionsRaw;
+          if (parsed && typeof parsed === 'object') {
+            customOptions = {
+              tone: str(parsed.tone, 120),
+              pacing: str(parsed.pacing, 40),
+              dialogueLanguage: str(parsed.dialogueLanguage, 40),
+              targetMinutes: clampInt(parsed.targetMinutes, 1, 30),
+              partNumber: clampInt(parsed.partNumber, 1, 50),
+              captionsOn: parsed.captionsOn == null ? null : !!parsed.captionsOn,
+              customPrompt: str(parsed.customPrompt, 2000),
+            };
+          }
+        } catch (_) {
+          return res.status(400).json({ error: 'Invalid customOptions data' });
+        }
+      }
+
+      const files = req.files || {};
+      const media = files.media?.[0] || null;
+      if (media) {
+        const badMedia = !ALLOWED_EXT.test(media.originalname) && !ALLOWED_MIME.test(media.mimetype || '');
+        if (badMedia) {
+          return res.status(400).json({ error: 'media must be an audio or video file' });
+        }
+        // Multer should always set .path; reject weird empty media fields early
+        if (typeof media.path !== 'string' || !media.path.trim()) {
+          return res.status(400).json({ error: 'media upload failed (no file path). Try again.' });
+        }
+      } else if (isMediaRequired(normVideoType)) {
+        // Narration-first modes (documentary, explainer, commercial, music video) are
+        // AUDIO-FIRST: the visuals are timed and matched to the real audio, so a media
+        // file is mandatory. Only acted/dialogue-driven modes (drama, movie, trailer,
+        // anime) may run without media (built from the script).
+        return res.status(400).json({
+          error: `A media (audio/video) file is required for the "${getMode(normVideoType).label}" video type. ` +
+                 `Only Drama, Movie, Cinematic Trailer, and Anime can be created without media.`,
+        });
       }
 
       // Parse structured characters (preferred)
@@ -283,7 +345,7 @@ app.post(
         }
       }
 
-      const charFiles = req.files.characterImages || [];
+      const charFiles = files.characterImages || [];
       if (characters.length > 0) {
         if (charFiles.length !== characters.length) {
           return res.status(400).json({ error: `You provided ${characters.length} character(s) but uploaded ${charFiles.length} image(s). They must match.` });
@@ -293,11 +355,14 @@ app.post(
           if (!/\.(png|jpg|jpeg|webp)$/i.test(f.originalname)) {
             return res.status(400).json({ error: 'Character images must be PNG, JPG, or WebP' });
           }
+          if (typeof f.path !== 'string' || !f.path.trim()) {
+            return res.status(400).json({ error: 'Character image upload failed (no file path). Try again.' });
+          }
         }
       }
 
       // Legacy fallback: turn old referenceImages into simple characters if no structured ones provided
-      const legacyRefs = req.files.referenceImages || [];
+      const legacyRefs = files.referenceImages || [];
       if (characters.length === 0 && legacyRefs.length > 0) {
         for (const img of legacyRefs) {
           if (!/\.(png|jpg|jpeg|webp)$/i.test(img.originalname)) {
@@ -311,12 +376,12 @@ app.post(
         }));
       }
 
-      // Now assign image paths (new or legacy)
+      // Now assign image paths (new or legacy) — only files with real string paths
       const finalCharacters = [];
       const allCharFiles = [...charFiles, ...legacyRefs]; // prefer new, fallback uses legacy
       for (let i = 0; i < characters.length; i++) {
         const srcFile = allCharFiles[i];
-        if (!srcFile) break;
+        if (!srcFile || typeof srcFile.path !== 'string' || !srcFile.path.trim()) break;
         finalCharacters.push({
           ...characters[i],
           imagePath: srcFile.path,
@@ -324,23 +389,44 @@ app.post(
       }
 
       // Optional style reference images (for art direction / environments)
-      const styleRefPaths = (req.files.styleReferences || []).map(f => f.path);
+      const styleRefPaths = (files.styleReferences || [])
+        .map(f => f && f.path)
+        .filter(p => typeof p === 'string' && p.trim());
+
+      // Drama / Movie / Anime: always store an exact target runtime (minutes).
+      const modeProf = getMode(normVideoType);
+      if (hasFixedRuntime(normVideoType) || modeProf.fixedRuntime) {
+        const defMin = modeProf.defaultTargetMinutes || 3;
+        const tm = customOptions.targetMinutes != null ? customOptions.targetMinutes : defMin;
+        customOptions.targetMinutes = Math.max(1, Math.min(30, Number(tm) || defMin));
+        customOptions.partNumber = Math.max(1, Math.min(50, Number(customOptions.partNumber) || 1));
+      }
 
       const jobData = {
         title: title.slice(0, 200),
-        script: script.slice(0, MAX_SCRIPT_CHARS),
-        mediaPath: media.path,
+        script: (script || '').slice(0, MAX_SCRIPT_CHARS),
+        // Always null (not undefined / empty string) when no media — drama path depends on this
+        mediaPath: media && typeof media.path === 'string' && media.path.trim() ? media.path : null,
         characters: finalCharacters,
         sceneStyle: (sceneStyle || '').toString().slice(0, 2000),
         styleReferencePaths: styleRefPaths,
+        videoType: normVideoType,
+        resolution: normResolution,
+        customOptions,
+        targetMinutes: customOptions.targetMinutes || null,
+        partNumber: customOptions.partNumber || null,
         apiKey: req.apiKey,
       };
 
       // For backward compat with existing worker code that still looks for referenceImagePaths
       if (finalCharacters.length > 0) {
-        jobData.referenceImagePaths = finalCharacters.map(c => c.imagePath);
+        jobData.referenceImagePaths = finalCharacters
+          .map(c => c.imagePath)
+          .filter(p => typeof p === 'string' && p.trim());
       } else if (legacyRefs.length) {
-        jobData.referenceImagePaths = legacyRefs.map(f => f.path);
+        jobData.referenceImagePaths = legacyRefs
+          .map(f => f.path)
+          .filter(p => typeof p === 'string' && p.trim());
       }
 
       if (!jobData.characters || jobData.characters.length === 0) {
@@ -443,7 +529,11 @@ app.get('/api/jobs/:id/editor', (req, res, next) => {
         finishedAt: job.editRender.finishedAt || null,
       } : { status: 'idle' },
       assets: getJobAssets(job),
-      transitions: ['none', 'fade', 'dissolve', 'fadeblack', 'slideleft', 'slideright'],
+      transitions: [
+        'none', 'mix', 'fade', 'dissolve', 'fadeblack', 'fadewhite',
+        'slideleft', 'slideright', 'slideup', 'slidedown',
+        'wipeleft', 'wiperight', 'circleopen', 'circleclose', 'distance', 'pixelize',
+      ],
     });
   } catch (err) {
     next(err);
@@ -630,8 +720,8 @@ app.post('/api/jobs/:id/editor/import', (req, res, next) => {
         trimStart: 0,
         trimEnd: Number(newClipMeta.duration.toFixed(3)),
         speed: 1,
-        transition: timeline.defaultTransition || 'fade',
-        transitionDuration: 0.35,
+        transition: timeline.defaultTransition || 'mix',
+        transitionDuration: Number(timeline.defaultTransitionDuration ?? 0.5) || 0.5,
       });
 
       updateJob(job.id, { editTimeline: timeline });
